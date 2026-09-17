@@ -49,6 +49,23 @@ async function fetchRemoteCount() {
 }
 
 // ─── Brand database ───────────────────────────────────────────────────────────
+//
+// ⚠️ UNVERIFIED DATA. As of 2026-09-17 these numbers are believed to be synthetic
+// placeholders, not transcribed from any brand's published size guide. Tells:
+// hip-minus-waist is a perfect constant within every jeans brand, sizes advance
+// in near-perfect arithmetic steps, and two brand pairs are byte-identical
+// (PrettyLittleThing == Boohoo, Zara == Mango).
+//
+// Two brands were spot-checked against live sources and both were wrong by more
+// than the gap between adjacent sizes — Good American by ~4 whole size steps
+// (it is a US-sized brand carrying UK measurements here). Recommendations are
+// currently off by multiple sizes, not marginally inaccurate.
+//
+// Do not patch individual brands: recommend() averages anchor brands together
+// via blendValues(), so mixing corrected and synthetic rows corrupts the blend.
+// Correct the dataset as a whole.
+//
+// Status per brand, evidence and sources: ./brands-sources.md
 
 const BRANDS = {
   jeans: {
@@ -656,7 +673,7 @@ function Landing({ count, onStart }) {
           Your size didn't change.<br />The clothes did.
         </h1>
         <p style={{ fontFamily: 'var(--font-body)', fontSize: 18, lineHeight: 1.6, color: 'var(--color-text-secondary)', maxWidth: 480, margin: '24px 0 36px' }}>
-          Fitseam tells you your exact size at any brand — and flags fit problems before you buy. Denim. Dresses. Bikinis.
+          Fitseam works out your size at any brand — and flags fit problems before you buy. Denim. Dresses. Bikinis.
         </p>
         <div style={{ display: 'flex', alignItems: 'center', gap: 24, flexWrap: 'wrap' }}>
           <button onClick={onStart} className="fg-btn-dark">Find my size →</button>

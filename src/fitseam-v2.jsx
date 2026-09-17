@@ -24,6 +24,52 @@ const local = {
   },
 };
 
+// ─── Abuse speed bumps ───────────────────────────────────────────────────────
+// ⚠️ These are NOT a security boundary. The Supabase anon key ships in the
+// client bundle, so anyone can POST straight to the REST endpoint and skip all
+// of this. Every table's RLS policy is `with check (true)` — there is no
+// server-side rate limit, size cap, or abuse check anywhere. What follows stops
+// casual bots and accidental double-submits, nothing more. See the header of
+// supabase/schema.sql for what still needs doing server-side.
+
+const SUBMIT_COOLDOWN_MS = 30_000;
+
+const cooldownLeft = (name) =>
+  Math.max(0, local.readInt(`fg:cooldown:${name}`, 0) - Date.now());
+
+const startCooldown = (name) =>
+  local.writeInt(`fg:cooldown:${name}`, Date.now() + SUBMIT_COOLDOWN_MS);
+
+// Returns [msRemaining, begin]. The interval only runs while a cooldown is
+// active, so idle forms cost nothing.
+function useCooldown(name) {
+  const [left, setLeft] = useState(() => cooldownLeft(name));
+  const active = left > 0;
+  useEffect(() => {
+    if (!active) return undefined;
+    const t = setInterval(() => setLeft(cooldownLeft(name)), 500);
+    return () => clearInterval(t);
+  }, [active, name]);
+  return [left, () => { startCooldown(name); setLeft(SUBMIT_COOLDOWN_MS); }];
+}
+
+// Honeypot input. Positioned off-screen rather than `display:none`: headless
+// browsers that compute styles skip genuinely hidden fields, while naive
+// form-fillers populate every input they can parse out of the HTML. Off-screen
+// catches both. tabIndex={-1} keeps it out of the keyboard path and
+// aria-hidden keeps it away from screen readers, so it costs no accessibility.
+function Honeypot({ id, value, onChange }) {
+  return (
+    <div aria-hidden="true" style={{ position: 'absolute', left: -9999, width: 1, height: 1, overflow: 'hidden' }}>
+      <label htmlFor={id}>Leave this field empty</label>
+      <input id={id} name="company_website" type="text" tabIndex={-1}
+        autoComplete="off" value={value} onChange={onChange} />
+    </div>
+  );
+}
+
+const cooldownNote = (ms) => `Just a moment — you can send again in ${Math.ceil(ms / 1000)}s.`;
+
 async function insertRow(table, row, localKey) {
   local.save(localKey, row);
   if (!hasSupabase) return;
@@ -234,16 +280,11 @@ const BRANDS = {
   },
 };
 
-// Accessors. Always reach `sizes` through these — iterating a brand object
+// Always reach a brand's size map through this — iterating a brand object
 // directly would treat `sizeSystem`/`measurementType`/etc. as size keys, which
-// is precisely what closest() and getBetween() would choke on.
+// is precisely what closest() and getBetween() would choke on. Read the
+// metadata fields off BRANDS[category][brand] directly.
 const chartOf = (category, brand) => BRANDS[category]?.[brand]?.sizes ?? null;
-const brandMeta = (category, brand) => {
-  const entry = BRANDS[category]?.[brand];
-  if (!entry) return null;
-  const { sizeSystem, measurementType, source, verified } = entry;
-  return { sizeSystem, measurementType, source, verified };
-};
 
 // ─── Recommendation engine ────────────────────────────────────────────────────
 
@@ -914,6 +955,7 @@ function FormFlow({ onComplete, onExit }) {
   const [fit, setFit] = useState('');
   const [target, setTarget] = useState('');
   const [consent, setConsent] = useState(false);
+  const [hp, setHp] = useState('');
 
   const setMeasure = (k) => (e) => setM(p => ({ ...p, [k]: e.target.value }));
   const brandList = category ? Object.keys(BRANDS[category === 'jeans' ? 'jeans' : category === 'dress' ? 'dress' : 'bikini']) : [];
@@ -951,7 +993,9 @@ function FormFlow({ onComplete, onExit }) {
 
   const finish = () => {
     const profile = { category, measurements: m, shape, anchors, preference: fit, targetBrand: target, height: m.height };
-    onComplete({ ...profile, result: recommend(profile) });
+    // Honeypot tripped: still show the user their result — the recommendation
+    // is computed client-side and costs nothing — but skip the remote write.
+    onComplete({ ...profile, result: recommend(profile), suppressWrite: !!hp });
   };
 
   const back = () => setStep(s => Math.max(0, s - 1));
@@ -1180,6 +1224,7 @@ function FormFlow({ onComplete, onExit }) {
                 I understand my size is an estimate, not a guarantee, and I agree to Fitseam's Privacy Policy and Terms of Service.
               </label>
             </div>
+            <Honeypot id="fg-company-website" value={hp} onChange={(e) => setHp(e.target.value)} />
           </div>
         )}
 
@@ -1216,6 +1261,10 @@ function ResultScreen({ profile, onRestart }) {
 
   const submitFeedback = (accurate) => {
     setFeedback(accurate);
+    // The buttons unmount after one click, but a reload re-renders them, so
+    // the cooldown is what actually stops a refresh-and-resubmit loop.
+    if (cooldownLeft('feedback') > 0) return;
+    startCooldown('feedback');
     const recommended = isBikini ? { top: r.topSize, bottom: r.bottomSize } : { size: r.size };
     insertRow('feedback', {
       accurate,
@@ -1680,10 +1729,17 @@ function RefundPage({ onNav }) {
 function ContactForm() {
   const [state, setState] = useState({ name: '', email: '', topic: '', message: '' });
   const [sent, setSent] = useState(false);
+  const [hp, setHp] = useState('');
+  const [cooling, beginCooldown] = useCooldown('contact');
   const upd = (k) => (e) => setState(s => ({ ...s, [k]: e.target.value }));
-  const ready = state.name && state.email && state.topic && state.message;
+  const ready = state.name && state.email && state.topic && state.message && cooling <= 0;
   const submit = () => {
+    // Honeypot tripped: drop the submission entirely — no Supabase write, no
+    // local record — but show the same confirmation, so a bot can't tell it
+    // was caught and retry with the field left blank.
+    if (hp) { setSent(true); return; }
     insertRow('contact_messages', { ...state, kind: 'general' }, `fg:contact:${rid()}`);
+    beginCooldown();
     setSent(true);
   };
   if (sent) return (
@@ -1721,10 +1777,11 @@ function ContactForm() {
         <label className="fg-label" htmlFor="contact-message">Your message</label>
         <textarea id="contact-message" className="fg-textarea" placeholder="Be specific. We'll be specific back." value={state.message} onChange={upd('message')} />
       </div>
+      <Honeypot id="contact-company-website" value={hp} onChange={(e) => setHp(e.target.value)} />
       <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginTop: 8, flexWrap: 'wrap' }}>
         <button onClick={submit} disabled={!ready} className="fg-btn-dark">Send →</button>
         <p style={{ fontFamily: 'var(--font-body)', fontSize: 12, color: 'var(--color-text-muted)', margin: 0 }}>
-          We use your email only to reply.
+          {cooling > 0 ? cooldownNote(cooling) : 'We use your email only to reply.'}
         </p>
       </div>
     </div>
@@ -1781,10 +1838,14 @@ function ContactPage({ onNav }) {
 function BrandForm() {
   const [state, setState] = useState({ brand: '', role: '', category: '', returns: '', name: '', email: '' });
   const [sent, setSent] = useState(false);
+  const [hp, setHp] = useState('');
+  const [cooling, beginCooldown] = useCooldown('brand');
   const upd = (k) => (e) => setState(s => ({ ...s, [k]: e.target.value }));
-  const ready = state.brand && state.role && state.category && state.email;
+  const ready = state.brand && state.role && state.category && state.email && cooling <= 0;
   const submit = () => {
+    if (hp) { setSent(true); return; }   // honeypot — see ContactForm
     insertRow('brand_inquiries', state, `fg:brand:${rid()}`);
+    beginCooldown();
     setSent(true);
   };
   if (sent) return (
@@ -1848,10 +1909,11 @@ function BrandForm() {
           <input id="brand-contact-email" className="fg-input" type="email" placeholder="you@brand.com" value={state.email} onChange={upd('email')} />
         </div>
       </div>
+      <Honeypot id="brand-company-website" value={hp} onChange={(e) => setHp(e.target.value)} />
       <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginTop: 8, flexWrap: 'wrap' }}>
         <button onClick={submit} disabled={!ready} className="fg-btn-dark">Request an audit →</button>
         <p style={{ fontFamily: 'var(--font-body)', fontSize: 12, color: 'var(--color-text-muted)', margin: 0 }}>
-          No marketing follow-up. One reply, from a human.
+          {cooling > 0 ? cooldownNote(cooling) : 'No marketing follow-up. One reply, from a human.'}
         </p>
       </div>
     </div>
@@ -1979,6 +2041,12 @@ export default function FitseamV2() {
 
   const onProfileComplete = (p) => {
     setProfile(p);
+    setPage('result');
+    // Honeypot tripped, or a sizing was submitted in the last 30s: show the
+    // result but don't write. The counter is driven off this table, so an
+    // unthrottled write here inflates a public-facing number.
+    if (p.suppressWrite || cooldownLeft('profile') > 0) return;
+    startCooldown('profile');
     setCount(c => { const n = c + 1; local.writeInt('fg:count', n); return n; });
     insertRow('profiles', {
       category: p.category,
@@ -1990,7 +2058,6 @@ export default function FitseamV2() {
       height: p.height || null,
       result: p.result,
     }, `fg:profile:${rid()}`);
-    setPage('result');
   };
 
   const nav = (target) => {

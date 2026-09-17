@@ -49,9 +49,10 @@ Two distinct defects here:
   it UK-style body measurements, so every size label is off by roughly four
   steps — the app will recommend a 6 to someone who needs a 14.
 - **Missing grade break.** Good American's chart jumps sharply at the 15/16
-  boundary where their curve grading starts. The synthetic linear data cannot
-  represent a discontinuity at all, so the top of the range is badly wrong even
-  after the offset is corrected.
+  boundary where their curve grading starts, so the top of the range is badly
+  wrong even after the size-system offset is corrected. The `BRANDS` schema
+  itself copes with this fine — see "The Good American discontinuity" below for
+  what actually breaks.
 
 ### Reformation (dress) — WRONG on hip
 
@@ -71,9 +72,22 @@ Source: <https://www.thereformation.com/fitting-and-sizes.html>, retrieved
 Bust is roughly right; waist is 3–5cm low; hip is 8–12cm low at every size. Note
 the real hip steps widen (3, 2, 3, 3, 5, 6) against the code's flat +3.
 
-⚠️ Measurement-type caveat: it is not yet confirmed whether Reformation's
-published hip figure is a body measurement or a high-hip/garment reference. That
-must be resolved before these numbers are used — see the trap below.
+**Measurement type — RESOLVED 2026-09-17 (viewed in-browser): body
+measurements, US numeric sizing.** The "How to measure" section instructs the
+reader to measure their own body ("Measure your bust…", "…to get your
+waistline"), and the page frames the chart as "a general guideline… Exact
+measurements vary with each style."
+
+⚠️ **One ambiguity remains.** Reformation defines **two** hip measurements —
+high hip ("where your hip bone begins") and low hip ("where your hip bone ends,
+about 3–4 inches below your high hip") — but the chart publishes a single
+unlabelled `Hip` column. Low hip is the conventional reading and is what the
+code's `h` key expects, but the brand does not state it. Treat as inferred.
+
+Also note the site has a **separate alpha chart** (XS–3X) above the numeric one
+with different values; alpha XS is numeric 0, alpha S is numeric 4. Reading the
+wrong table silently shifts every row. The numeric figures above were confirmed
+on-screen for sizes 2–12.
 
 ---
 
@@ -94,8 +108,14 @@ uniform offset we have now. **Correct the dataset as a whole, or not at all.**
 Brands publish either *body* measurements (what your body measures) or *garment*
 measurements (the finished item, including ease). Mixing the two silently breaks
 the recommendation logic even when every individual number is copied correctly.
-ASOS publishes body measurements; Reformation's basis is unconfirmed. Record the
-type per brand in the table below, not just the numbers.
+ASOS and Reformation both publish body measurements (each confirmed on the
+brand's own page). Record the type per brand in the table below, not just the
+numbers.
+
+`BRANDS` now carries this as a `measurementType` field per brand. It is
+`'unknown'` on every row today, because the stored numbers are still the
+synthetic placeholders — set it to `'body'`/`'garment'` only when the row's
+numbers are actually the brand's published ones.
 
 ## Tooling note
 
@@ -260,7 +280,7 @@ Fill in as each brand is checked. `Type` = body or garment.
 | dress | Fashion Nova | ❌ Unverified | ? | — | — |
 | dress | Shein | ❌ Unverified | ? | — | — |
 | dress | Mango | ❌ Unverified — identical to Zara | ? | — | — |
-| dress | Reformation | ⚠️ **Verified wrong** — see above | unconfirmed | thereformation.com | 2026-09-17 |
+| dress | Reformation | ⚠️ **Verified wrong** — see above | body (US) | thereformation.com | 2026-09-17 |
 | dress | Mr Price | ❌ Unverified | ? | — | — |
 | bikini | ASOS | ❌ Unverified | ? | — | — |
 | bikini | Fashion Nova | ❌ Unverified | ? | — | — |
@@ -276,6 +296,79 @@ Fill in as each brand is checked. `Type` = body or garment.
 Once the dataset is genuinely sourced, re-verify quarterly — brands regrade
 without announcing it. Next review due one quarter after the first full
 verification pass completes.
+
+---
+
+## The Good American discontinuity — resolved, but it exposed two engine bugs
+
+**The schema does not need to change.** `closest()` and `getBetween()` are both
+grade-agnostic: they scan entries and compare values, so an irregular or
+discontinuous chart is already representable. The 15/16 jump is not a data-shape
+problem.
+
+What the jump *does* expose is that the engine never reports how well the user
+actually matches the chart. Real Good American rows around the break, in cm:
+
+| Size | Hip | Step |
+|------|-----|------|
+| 14 | 109 | — |
+| 15 | 114 | +5 |
+| 16 | 127 | **+13** |
+| 18 | 132 | +5 |
+
+That 13cm step is a dead zone. Someone with a 120cm hip is 6cm from the nearest
+size in either direction — there is no size that fits them — and the engine says
+nothing about it.
+
+### Bug 1 — confidence ignores fit quality
+
+`closest()` returns `{ size, diff }`, but every caller uses only `.size` and
+discards `diff`. `anchorConfidence(n, variance)` is computed purely from how
+many anchors there are and whether they agree *with each other*; it never looks
+at how far the user's body is from the recommended size. Measured, no anchors:
+
+| User hip | Recommended | Off by | Confidence |
+|----------|-------------|--------|------------|
+| 109 | 14 | 0cm | Medium |
+| 114 | 15 | 0cm | Medium |
+| **120** | 15 | **6cm** | **Medium** |
+| 127 | 16 | 0cm | Medium |
+
+A perfect match and a 6cm miss are reported identically.
+
+*Fix:* thread `hipRec.diff` into the confidence calculation and raise a flag
+when it exceeds roughly half the local grade step.
+
+### Bug 2 — anchors dilute the user's own measurement, and raise confidence while doing it
+
+`blendValues()` averages the user's measurement with each anchor's implied
+measurement at **equal weight**, so the more anchors a user adds, the less their
+actual body counts. With a real 127cm hip:
+
+| Anchors | Recommended | That size's hip | Confidence |
+|---------|-------------|-----------------|------------|
+| 0 | **16** | 127cm — correct | Medium |
+| 1 | 15 | 114cm | Medium |
+| 2 | 15 | 114cm | Medium-High |
+| 3 | 15 | 114cm | **High** |
+
+Adding anchors moves the answer from correct to 13cm too small **and raises the
+stated confidence from Medium to High.** The user's own measurement is only 25%
+of the signal at three anchors.
+
+The cause is that agreement *among anchors* is read as certainty. Here the three
+anchors agree closely with each other (implied hips 109/110/107, variance 3) and
+all disagree with the body by ~15cm. That pattern — anchors tightly clustered
+but far from the measurement — is precisely the signal that something is wrong,
+and the engine scores it as maximum confidence.
+
+*Fix:* weight the user's measurement above anchor-implied values rather than
+averaging equally, and treat measurement-vs-anchor disagreement as a confidence
+*penalty*, separate from anchor-vs-anchor variance.
+
+> Both bugs are latent behind the synthetic data today, because the synthetic
+> charts are smooth and evenly graded — there are no dead zones to fall into.
+> **Correcting the brand data will surface both.** Fix them in the same pass.
 
 ---
 
@@ -330,7 +423,16 @@ plain fetch (timeout).
 
 ### Still open
 
-- Reformation's hip figure is recorded but its **body-vs-garment basis is
-  unconfirmed** — resolve before use.
-- Good American's real chart has a **discontinuity at the 15/16 curve-grade
-  break**. Whatever shape `BRANDS` takes must be able to represent a jump.
+- Reformation's `Hip` column is **unlabelled high-vs-low hip**. Body-vs-garment
+  is resolved (body); which hip it is, is inferred. Confirm before use.
+- **Fix the two engine bugs above in the same pass as the data.** They are
+  latent today only because the synthetic charts are smooth; correcting the
+  brand data will surface both.
+- `measurementType` is `'unknown'` on all 30 rows. Each must be set as its
+  numbers are replaced with sourced ones.
+
+### Closed
+
+- ~~Good American's discontinuity needs a schema that can represent a jump.~~
+  Resolved: `closest()` and `getBetween()` are grade-agnostic, so the existing
+  shape handles it. The real exposure was the two confidence bugs.

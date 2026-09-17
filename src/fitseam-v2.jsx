@@ -67,43 +67,182 @@ async function fetchRemoteCount() {
 //
 // Status per brand, evidence and sources: ./brands-sources.md
 
+// Each brand is { sizeSystem, measurementType, source, verified, sizes }.
+//
+//   sizeSystem      the scale the brand's own labels are on. Never normalise a
+//                   brand onto a different scale — doing exactly that is what
+//                   put Good American (US) on UK numbers and left it four size
+//                   steps adrift.
+//                     'UK' | 'US' | 'EU' | 'SA' | 'alpha' | 'denim-inch'
+//
+//   measurementType whether `sizes` holds body measurements or finished-garment
+//                   measurements. recommend() compares charts against the
+//                   user's *body*, so a 'garment' chart is invalid input
+//                   without an ease adjustment.
+//                     'body' | 'garment' | 'unknown'
+//
+//   source          where the brand's real chart lives, for re-verification.
+//   verified        ISO date the numbers in `sizes` were checked against
+//                   `source`. null means the numbers are NOT that chart.
+//
+// measurementType is 'unknown' and verified is null for every brand below,
+// because the stored numbers are still the synthetic placeholders. Where a
+// source URL is filled in, the real chart has been located and transcribed into
+// brands-sources.md, but has deliberately not been merged here yet — see the
+// "partial correction is unsafe" note in that file.
+
 const BRANDS = {
   jeans: {
-    "Levi's":         { "24":{w:61,h:86},"25":{w:64,h:89},"26":{w:66,h:91},"27":{w:69,h:94},"28":{w:71,h:96},"29":{w:74,h:99},"30":{w:76,h:101},"31":{w:79,h:104},"32":{w:81,h:106},"33":{w:84,h:109},"34":{w:86,h:111} },
-    "Zara":           { "XS":{w:62,h:88},"S":{w:66,h:92},"M":{w:70,h:96},"L":{w:74,h:100},"XL":{w:78,h:104} },
-    "H&M":            { "34":{w:62,h:88},"36":{w:66,h:92},"38":{w:70,h:96},"40":{w:74,h:100},"42":{w:78,h:104},"44":{w:82,h:108} },
-    "ASOS":           { "6":{w:61,h:87},"8":{w:65,h:91},"10":{w:69,h:95},"12":{w:73,h:99},"14":{w:77,h:103},"16":{w:81,h:107} },
-    "Fashion Nova":   { "XS":{w:62,h:88},"S":{w:66,h:92},"M":{w:70,h:97},"L":{w:75,h:102},"XL":{w:80,h:107},"XXL":{w:85,h:112} },
-    "PrettyLittleThing": { "6":{w:61,h:87},"8":{w:65,h:91},"10":{w:69,h:95},"12":{w:73,h:100},"14":{w:78,h:105},"16":{w:83,h:110} },
-    "Boohoo":         { "6":{w:61,h:87},"8":{w:65,h:91},"10":{w:69,h:95},"12":{w:73,h:100},"14":{w:78,h:105},"16":{w:83,h:110} },
-    "Shein":          { "XS":{w:62,h:86},"S":{w:66,h:90},"M":{w:70,h:94},"L":{w:74,h:99},"XL":{w:79,h:104},"XXL":{w:84,h:109} },
-    "Good American":  { "6":{w:61,h:88},"8":{w:65,h:92},"10":{w:69,h:96},"12":{w:73,h:100},"14":{w:77,h:104},"16":{w:81,h:108} },
-    "River Island":   { "6":{w:61,h:86},"8":{w:65,h:90},"10":{w:69,h:94},"12":{w:73,h:98},"14":{w:77,h:102},"16":{w:81,h:106} },
-    "Mr Price":       { "XS":{w:63,h:88},"S":{w:67,h:92},"M":{w:71,h:96},"L":{w:75,h:100},"XL":{w:80,h:105} },
-    "Woolworths SA":  { "10":{w:67,h:92},"12":{w:71,h:96},"14":{w:75,h:100},"16":{w:79,h:104},"18":{w:83,h:108} },
+    "Levi's": {
+      sizeSystem: 'denim-inch', measurementType: 'unknown',
+      source: 'https://www.levi.com/GB/en_GB/info/sizechart', verified: null,
+      sizes: { "24":{w:61,h:86},"25":{w:64,h:89},"26":{w:66,h:91},"27":{w:69,h:94},"28":{w:71,h:96},"29":{w:74,h:99},"30":{w:76,h:101},"31":{w:79,h:104},"32":{w:81,h:106},"33":{w:84,h:109},"34":{w:86,h:111} },
+    },
+    "Zara": {
+      sizeSystem: 'alpha', measurementType: 'unknown', source: null, verified: null,
+      sizes: { "XS":{w:62,h:88},"S":{w:66,h:92},"M":{w:70,h:96},"L":{w:74,h:100},"XL":{w:78,h:104} },
+    },
+    "H&M": {
+      // H&M publishes size charts per garment, not per brand — a single row
+      // here cannot represent it correctly. See brands-sources.md.
+      sizeSystem: 'EU', measurementType: 'unknown', source: null, verified: null,
+      sizes: { "34":{w:62,h:88},"36":{w:66,h:92},"38":{w:70,h:96},"40":{w:74,h:100},"42":{w:78,h:104},"44":{w:82,h:108} },
+    },
+    "ASOS": {
+      sizeSystem: 'UK', measurementType: 'unknown',
+      source: 'https://www.asos.com/discover/size-charts/women/dresses/', verified: null,
+      sizes: { "6":{w:61,h:87},"8":{w:65,h:91},"10":{w:69,h:95},"12":{w:73,h:99},"14":{w:77,h:103},"16":{w:81,h:107} },
+    },
+    "Fashion Nova": {
+      sizeSystem: 'alpha', measurementType: 'unknown', source: null, verified: null,
+      sizes: { "XS":{w:62,h:88},"S":{w:66,h:92},"M":{w:70,h:97},"L":{w:75,h:102},"XL":{w:80,h:107},"XXL":{w:85,h:112} },
+    },
+    "PrettyLittleThing": {
+      sizeSystem: 'UK', measurementType: 'unknown', source: null, verified: null,
+      sizes: { "6":{w:61,h:87},"8":{w:65,h:91},"10":{w:69,h:95},"12":{w:73,h:100},"14":{w:78,h:105},"16":{w:83,h:110} },
+    },
+    "Boohoo": {
+      sizeSystem: 'UK', measurementType: 'unknown', source: null, verified: null,
+      sizes: { "6":{w:61,h:87},"8":{w:65,h:91},"10":{w:69,h:95},"12":{w:73,h:100},"14":{w:78,h:105},"16":{w:83,h:110} },
+    },
+    "Shein": {
+      sizeSystem: 'alpha', measurementType: 'unknown', source: null, verified: null,
+      sizes: { "XS":{w:62,h:86},"S":{w:66,h:90},"M":{w:70,h:94},"L":{w:74,h:99},"XL":{w:79,h:104},"XXL":{w:84,h:109} },
+    },
+    "Good American": {
+      // ⚠️ US-sized brand. These numbers are on a UK scale, so every size here
+      // is ~4 steps adrift (US 6 = UK 10). The real chart also jumps sharply at
+      // the 15/16 curve-grade break.
+      sizeSystem: 'US', measurementType: 'unknown',
+      source: 'https://www.scheels.com/size-chart/good-american-womens-apparel-size-chart', verified: null,
+      sizes: { "6":{w:61,h:88},"8":{w:65,h:92},"10":{w:69,h:96},"12":{w:73,h:100},"14":{w:77,h:104},"16":{w:81,h:108} },
+    },
+    "River Island": {
+      sizeSystem: 'UK', measurementType: 'unknown', source: null, verified: null,
+      sizes: { "6":{w:61,h:86},"8":{w:65,h:90},"10":{w:69,h:94},"12":{w:73,h:98},"14":{w:77,h:102},"16":{w:81,h:106} },
+    },
+    "Mr Price": {
+      sizeSystem: 'alpha', measurementType: 'unknown', source: null, verified: null,
+      sizes: { "XS":{w:63,h:88},"S":{w:67,h:92},"M":{w:71,h:96},"L":{w:75,h:100},"XL":{w:80,h:105} },
+    },
+    "Woolworths SA": {
+      sizeSystem: 'SA', measurementType: 'unknown', source: null, verified: null,
+      sizes: { "10":{w:67,h:92},"12":{w:71,h:96},"14":{w:75,h:100},"16":{w:79,h:104},"18":{w:83,h:108} },
+    },
   },
   dress: {
-    "Zara":           { "XS":{b:84,w:64,h:88},"S":{b:88,w:68,h:92},"M":{b:92,w:72,h:96},"L":{b:96,w:76,h:100},"XL":{b:100,w:80,h:104} },
-    "H&M":            { "34":{b:83,w:63,h:87},"36":{b:87,w:67,h:91},"38":{b:91,w:71,h:95},"40":{b:95,w:75,h:99},"42":{b:99,w:79,h:103},"44":{b:103,w:83,h:107} },
-    "ASOS":           { "6":{b:81,w:61,h:85},"8":{b:85,w:65,h:89},"10":{b:89,w:69,h:93},"12":{b:93,w:73,h:97},"14":{b:97,w:77,h:101},"16":{b:101,w:81,h:105},"18":{b:106,w:86,h:110} },
-    "Boohoo":         { "6":{b:81,w:61,h:85},"8":{b:85,w:65,h:89},"10":{b:89,w:69,h:93},"12":{b:93,w:73,h:98},"14":{b:98,w:78,h:103},"16":{b:103,w:83,h:108} },
-    "PrettyLittleThing": { "6":{b:80,w:60,h:84},"8":{b:84,w:64,h:88},"10":{b:88,w:68,h:92},"12":{b:92,w:72,h:97},"14":{b:97,w:77,h:102},"16":{b:102,w:82,h:107} },
-    "Fashion Nova":   { "XS":{b:84,w:64,h:88},"S":{b:88,w:68,h:93},"M":{b:92,w:72,h:98},"L":{b:97,w:77,h:103},"XL":{b:102,w:82,h:108},"XXL":{b:107,w:87,h:113} },
-    "Shein":          { "XS":{b:83,w:63,h:87},"S":{b:87,w:67,h:91},"M":{b:91,w:71,h:95},"L":{b:95,w:75,h:100},"XL":{b:100,w:80,h:105},"XXL":{b:105,w:85,h:110} },
-    "Mango":          { "XS":{b:84,w:64,h:88},"S":{b:88,w:68,h:92},"M":{b:92,w:72,h:96},"L":{b:96,w:76,h:100},"XL":{b:100,w:80,h:104} },
-    "Reformation":    { "0":{b:81,w:61,h:85},"2":{b:84,w:64,h:88},"4":{b:87,w:67,h:91},"6":{b:90,w:70,h:94},"8":{b:93,w:73,h:97},"10":{b:96,w:76,h:100},"12":{b:100,w:80,h:104} },
-    "Mr Price":       { "XS":{b:84,w:64,h:88},"S":{b:88,w:68,h:92},"M":{b:92,w:72,h:96},"L":{b:96,w:76,h:101},"XL":{b:101,w:81,h:106} },
+    "Zara": {
+      sizeSystem: 'alpha', measurementType: 'unknown', source: null, verified: null,
+      sizes: { "XS":{b:84,w:64,h:88},"S":{b:88,w:68,h:92},"M":{b:92,w:72,h:96},"L":{b:96,w:76,h:100},"XL":{b:100,w:80,h:104} },
+    },
+    "H&M": {
+      // Per-garment charts — see the jeans entry above.
+      sizeSystem: 'EU', measurementType: 'unknown', source: null, verified: null,
+      sizes: { "34":{b:83,w:63,h:87},"36":{b:87,w:67,h:91},"38":{b:91,w:71,h:95},"40":{b:95,w:75,h:99},"42":{b:99,w:79,h:103},"44":{b:103,w:83,h:107} },
+    },
+    "ASOS": {
+      sizeSystem: 'UK', measurementType: 'unknown',
+      source: 'https://www.asos.com/discover/size-charts/women/dresses/', verified: null,
+      sizes: { "6":{b:81,w:61,h:85},"8":{b:85,w:65,h:89},"10":{b:89,w:69,h:93},"12":{b:93,w:73,h:97},"14":{b:97,w:77,h:101},"16":{b:101,w:81,h:105},"18":{b:106,w:86,h:110} },
+    },
+    "Boohoo": {
+      sizeSystem: 'UK', measurementType: 'unknown', source: null, verified: null,
+      sizes: { "6":{b:81,w:61,h:85},"8":{b:85,w:65,h:89},"10":{b:89,w:69,h:93},"12":{b:93,w:73,h:98},"14":{b:98,w:78,h:103},"16":{b:103,w:83,h:108} },
+    },
+    "PrettyLittleThing": {
+      sizeSystem: 'UK', measurementType: 'unknown', source: null, verified: null,
+      sizes: { "6":{b:80,w:60,h:84},"8":{b:84,w:64,h:88},"10":{b:88,w:68,h:92},"12":{b:92,w:72,h:97},"14":{b:97,w:77,h:102},"16":{b:102,w:82,h:107} },
+    },
+    "Fashion Nova": {
+      sizeSystem: 'alpha', measurementType: 'unknown', source: null, verified: null,
+      sizes: { "XS":{b:84,w:64,h:88},"S":{b:88,w:68,h:93},"M":{b:92,w:72,h:98},"L":{b:97,w:77,h:103},"XL":{b:102,w:82,h:108},"XXL":{b:107,w:87,h:113} },
+    },
+    "Shein": {
+      sizeSystem: 'alpha', measurementType: 'unknown', source: null, verified: null,
+      sizes: { "XS":{b:83,w:63,h:87},"S":{b:87,w:67,h:91},"M":{b:91,w:71,h:95},"L":{b:95,w:75,h:100},"XL":{b:100,w:80,h:105},"XXL":{b:105,w:85,h:110} },
+    },
+    "Mango": {
+      sizeSystem: 'alpha', measurementType: 'unknown', source: null, verified: null,
+      sizes: { "XS":{b:84,w:64,h:88},"S":{b:88,w:68,h:92},"M":{b:92,w:72,h:96},"L":{b:96,w:76,h:100},"XL":{b:100,w:80,h:104} },
+    },
+    "Reformation": {
+      // Body measurements, US numeric — confirmed 2026-09-17. The published
+      // chart's single "Hip" column is unlabelled while the measuring guide
+      // defines both a high and a low hip; low hip is inferred, not stated.
+      sizeSystem: 'US', measurementType: 'unknown',
+      source: 'https://www.thereformation.com/fitting-and-sizes.html', verified: null,
+      sizes: { "0":{b:81,w:61,h:85},"2":{b:84,w:64,h:88},"4":{b:87,w:67,h:91},"6":{b:90,w:70,h:94},"8":{b:93,w:73,h:97},"10":{b:96,w:76,h:100},"12":{b:100,w:80,h:104} },
+    },
+    "Mr Price": {
+      sizeSystem: 'alpha', measurementType: 'unknown', source: null, verified: null,
+      sizes: { "XS":{b:84,w:64,h:88},"S":{b:88,w:68,h:92},"M":{b:92,w:72,h:96},"L":{b:96,w:76,h:101},"XL":{b:101,w:81,h:106} },
+    },
   },
   bikini: {
-    "ASOS":           { top:{"6":{b:81,band:71},"8":{b:84,band:74},"10":{b:87,band:77},"12":{b:91,band:81},"14":{b:96,band:86},"16":{b:101,band:91}}, bottom:{"6":{w:61,h:86},"8":{w:65,h:90},"10":{w:69,h:94},"12":{w:73,h:98},"14":{w:77,h:102},"16":{w:81,h:106}} },
-    "Fashion Nova":   { top:{"XS":{b:84,band:72},"S":{b:88,band:76},"M":{b:93,band:81},"L":{b:98,band:86},"XL":{b:103,band:91},"XXL":{b:109,band:97}}, bottom:{"XS":{w:62,h:88},"S":{w:66,h:92},"M":{w:71,h:97},"L":{w:76,h:102},"XL":{w:81,h:107}} },
-    "Shein":          { top:{"XS":{b:82,band:70},"S":{b:86,band:74},"M":{b:90,band:78},"L":{b:94,band:82},"XL":{b:99,band:87},"XXL":{b:104,band:92}}, bottom:{"XS":{w:62,h:87},"S":{w:66,h:91},"M":{w:70,h:95},"L":{w:75,h:100},"XL":{w:80,h:105}} },
-    "H&M":            { top:{"XS":{b:82,band:70},"S":{b:86,band:74},"M":{b:90,band:78},"L":{b:95,band:83},"XL":{b:100,band:88}}, bottom:{"XS":{w:62,h:88},"S":{w:66,h:92},"M":{w:70,h:96},"L":{w:74,h:100},"XL":{w:78,h:104}} },
-    "PrettyLittleThing": { top:{"6":{b:80,band:68},"8":{b:83,band:71},"10":{b:87,band:75},"12":{b:91,band:79},"14":{b:96,band:84},"16":{b:101,band:89}}, bottom:{"6":{w:61,h:87},"8":{w:65,h:91},"10":{w:69,h:95},"12":{w:73,h:99},"14":{w:77,h:103},"16":{w:82,h:108}} },
-    "Triangl":        { top:{"XS":{b:83,band:71},"S":{b:87,band:75},"M":{b:91,band:79},"L":{b:95,band:83},"XL":{b:100,band:88}}, bottom:{"XS":{w:62,h:88},"S":{w:66,h:92},"M":{w:70,h:96},"L":{w:75,h:101},"XL":{w:80,h:106}} },
-    "Cupshe":         { top:{"S":{b:84,band:72},"M":{b:88,band:76},"L":{b:93,band:81},"XL":{b:98,band:86},"XXL":{b:104,band:92}}, bottom:{"S":{w:64,h:90},"M":{w:68,h:94},"L":{w:73,h:99},"XL":{w:78,h:104},"XXL":{w:83,h:109}} },
-    "Boohoo":         { top:{"6":{b:81,band:69},"8":{b:84,band:72},"10":{b:88,band:76},"12":{b:92,band:80},"14":{b:97,band:85},"16":{b:102,band:90}}, bottom:{"6":{w:61,h:87},"8":{w:65,h:91},"10":{w:69,h:95},"12":{w:73,h:99},"14":{w:78,h:104},"16":{w:83,h:109}} },
+    "ASOS": {
+      sizeSystem: 'UK', measurementType: 'unknown', source: null, verified: null,
+      sizes: { top:{"6":{b:81,band:71},"8":{b:84,band:74},"10":{b:87,band:77},"12":{b:91,band:81},"14":{b:96,band:86},"16":{b:101,band:91}}, bottom:{"6":{w:61,h:86},"8":{w:65,h:90},"10":{w:69,h:94},"12":{w:73,h:98},"14":{w:77,h:102},"16":{w:81,h:106}} },
+    },
+    "Fashion Nova": {
+      sizeSystem: 'alpha', measurementType: 'unknown', source: null, verified: null,
+      sizes: { top:{"XS":{b:84,band:72},"S":{b:88,band:76},"M":{b:93,band:81},"L":{b:98,band:86},"XL":{b:103,band:91},"XXL":{b:109,band:97}}, bottom:{"XS":{w:62,h:88},"S":{w:66,h:92},"M":{w:71,h:97},"L":{w:76,h:102},"XL":{w:81,h:107}} },
+    },
+    "Shein": {
+      sizeSystem: 'alpha', measurementType: 'unknown', source: null, verified: null,
+      sizes: { top:{"XS":{b:82,band:70},"S":{b:86,band:74},"M":{b:90,band:78},"L":{b:94,band:82},"XL":{b:99,band:87},"XXL":{b:104,band:92}}, bottom:{"XS":{w:62,h:87},"S":{w:66,h:91},"M":{w:70,h:95},"L":{w:75,h:100},"XL":{w:80,h:105}} },
+    },
+    "H&M": {
+      sizeSystem: 'alpha', measurementType: 'unknown', source: null, verified: null,
+      sizes: { top:{"XS":{b:82,band:70},"S":{b:86,band:74},"M":{b:90,band:78},"L":{b:95,band:83},"XL":{b:100,band:88}}, bottom:{"XS":{w:62,h:88},"S":{w:66,h:92},"M":{w:70,h:96},"L":{w:74,h:100},"XL":{w:78,h:104}} },
+    },
+    "PrettyLittleThing": {
+      sizeSystem: 'UK', measurementType: 'unknown', source: null, verified: null,
+      sizes: { top:{"6":{b:80,band:68},"8":{b:83,band:71},"10":{b:87,band:75},"12":{b:91,band:79},"14":{b:96,band:84},"16":{b:101,band:89}}, bottom:{"6":{w:61,h:87},"8":{w:65,h:91},"10":{w:69,h:95},"12":{w:73,h:99},"14":{w:77,h:103},"16":{w:82,h:108}} },
+    },
+    "Triangl": {
+      sizeSystem: 'alpha', measurementType: 'unknown', source: null, verified: null,
+      sizes: { top:{"XS":{b:83,band:71},"S":{b:87,band:75},"M":{b:91,band:79},"L":{b:95,band:83},"XL":{b:100,band:88}}, bottom:{"XS":{w:62,h:88},"S":{w:66,h:92},"M":{w:70,h:96},"L":{w:75,h:101},"XL":{w:80,h:106}} },
+    },
+    "Cupshe": {
+      sizeSystem: 'alpha', measurementType: 'unknown', source: null, verified: null,
+      sizes: { top:{"S":{b:84,band:72},"M":{b:88,band:76},"L":{b:93,band:81},"XL":{b:98,band:86},"XXL":{b:104,band:92}}, bottom:{"S":{w:64,h:90},"M":{w:68,h:94},"L":{w:73,h:99},"XL":{w:78,h:104},"XXL":{w:83,h:109}} },
+    },
+    "Boohoo": {
+      sizeSystem: 'UK', measurementType: 'unknown', source: null, verified: null,
+      sizes: { top:{"6":{b:81,band:69},"8":{b:84,band:72},"10":{b:88,band:76},"12":{b:92,band:80},"14":{b:97,band:85},"16":{b:102,band:90}}, bottom:{"6":{w:61,h:87},"8":{w:65,h:91},"10":{w:69,h:95},"12":{w:73,h:99},"14":{w:78,h:104},"16":{w:83,h:109}} },
+    },
   },
+};
+
+// Accessors. Always reach `sizes` through these — iterating a brand object
+// directly would treat `sizeSystem`/`measurementType`/etc. as size keys, which
+// is precisely what closest() and getBetween() would choke on.
+const chartOf = (category, brand) => BRANDS[category]?.[brand]?.sizes ?? null;
+const brandMeta = (category, brand) => {
+  const entry = BRANDS[category]?.[brand];
+  if (!entry) return null;
+  const { sizeSystem, measurementType, source, verified } = entry;
+  return { sizeSystem, measurementType, source, verified };
 };
 
 // ─── Recommendation engine ────────────────────────────────────────────────────
@@ -127,8 +266,8 @@ const getBetween = (chart, key, val) => {
 };
 
 const impliedFor = (category, brand, size) => {
-  if (category === 'jeans') return BRANDS.jeans[brand]?.[size] ?? null;
-  if (category === 'dress') return BRANDS.dress[brand]?.[size] ?? null;
+  if (category === 'jeans') return chartOf('jeans', brand)?.[size] ?? null;
+  if (category === 'dress') return chartOf('dress', brand)?.[size] ?? null;
   return null;
 };
 
@@ -160,7 +299,7 @@ function recommend({ category, measurements: m, anchors = [], preference = 'regu
   const off = prefOffset(preference);
 
   if (category === 'jeans') {
-    const chart = BRANDS.jeans[targetBrand];
+    const chart = chartOf('jeans', targetBrand);
     if (!chart) return null;
 
     const implied = validAnchors.map(a => impliedFor('jeans', a.brand, a.size)).filter(Boolean);
@@ -191,7 +330,7 @@ function recommend({ category, measurements: m, anchors = [], preference = 'regu
   }
 
   if (category === 'dress') {
-    const chart = BRANDS.dress[targetBrand];
+    const chart = chartOf('dress', targetBrand);
     if (!chart) return null;
 
     const implied = validAnchors.map(a => impliedFor('dress', a.brand, a.size)).filter(Boolean);
@@ -220,7 +359,7 @@ function recommend({ category, measurements: m, anchors = [], preference = 'regu
   }
 
   if (category === 'bikini') {
-    const brandData = BRANDS.bikini[targetBrand];
+    const brandData = chartOf('bikini', targetBrand);
     if (!brandData) return null;
     const bust = parseFloat(m.bust) || 0;
     const hip  = parseFloat(m.hip)  || 0;
@@ -784,9 +923,9 @@ function FormFlow({ onComplete, onExit }) {
   };
   const targetBrands = brandList.filter(b => !anchors.some(a => a.brand === b));
   const sizesFor = (brand) => {
-    const chart = category === 'jeans' ? BRANDS.jeans[brand]
-      : category === 'dress' ? BRANDS.dress[brand]
-      : BRANDS.bikini[brand]?.top;
+    const chart = category === 'jeans' ? chartOf('jeans', brand)
+      : category === 'dress' ? chartOf('dress', brand)
+      : chartOf('bikini', brand)?.top;
     return chart ? Object.keys(chart) : [];
   };
 

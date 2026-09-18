@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "motion/react";
-import { supabase, hasSupabase } from "./supabase";
+import { supabase, hasSupabase, SUPABASE_URL, SUPABASE_ANON_KEY } from "./supabase";
+import { useTurnstile, TurnstileWidget, hasTurnstile } from "./turnstile";
 
 // ─── Persistence ─────────────────────────────────────────────────────────────
 // Supabase when env vars are set; localStorage otherwise (or in addition,
@@ -70,14 +71,40 @@ function Honeypot({ id, value, onChange }) {
 
 const cooldownNote = (ms) => `Just a moment — you can send again in ${Math.ceil(ms / 1000)}s.`;
 
-async function insertRow(table, row, localKey) {
+// All writes go through the verified-insert Edge Function, which checks the
+// Turnstile token server-side and inserts with the service-role key. The
+// browser has no insert rights of its own — the anon role's insert policies are
+// dropped in schema.sql, so a direct supabase.from(table).insert() would now be
+// rejected by RLS.
+async function insertRow(table, row, localKey, turnstileToken) {
   local.save(localKey, row);
-  if (!hasSupabase) return;
+  if (!hasSupabase) return { ok: true, offline: true };
+
+  if (hasTurnstile && !turnstileToken) {
+    console.warn(`[fitseam] refusing to write ${table} without a Turnstile token`);
+    return { ok: false, reason: 'no-token' };
+  }
+
   try {
-    const { error } = await supabase.from(table).insert(row);
-    if (error) console.warn(`[fitseam] Supabase insert failed (${table}):`, error.message);
+    const res = await fetch(`${SUPABASE_URL}/functions/v1/verified-insert`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        // The anon key authenticates the call to the function itself. It grants
+        // nothing on its own now that the insert policies are gone.
+        apikey: SUPABASE_ANON_KEY,
+        Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+      },
+      body: JSON.stringify({ table, row, turnstileToken }),
+    });
+    if (!res.ok) {
+      console.warn(`[fitseam] verified-insert rejected (${table}):`, res.status);
+      return { ok: false, reason: `http-${res.status}` };
+    }
+    return { ok: true };
   } catch (e) {
-    console.warn(`[fitseam] Supabase insert threw (${table}):`, e?.message ?? e);
+    console.warn(`[fitseam] verified-insert threw (${table}):`, e?.message ?? e);
+    return { ok: false, reason: 'network' };
   }
 }
 
@@ -956,6 +983,7 @@ function FormFlow({ onComplete, onExit }) {
   const [target, setTarget] = useState('');
   const [consent, setConsent] = useState(false);
   const [hp, setHp] = useState('');
+  const turnstile = useTurnstile();
 
   const setMeasure = (k) => (e) => setM(p => ({ ...p, [k]: e.target.value }));
   const brandList = category ? Object.keys(BRANDS[category === 'jeans' ? 'jeans' : category === 'dress' ? 'dress' : 'bikini']) : [];
@@ -995,7 +1023,12 @@ function FormFlow({ onComplete, onExit }) {
     const profile = { category, measurements: m, shape, anchors, preference: fit, targetBrand: target, height: m.height };
     // Honeypot tripped: still show the user their result — the recommendation
     // is computed client-side and costs nothing — but skip the remote write.
-    onComplete({ ...profile, result: recommend(profile), suppressWrite: !!hp });
+    onComplete({
+      ...profile,
+      result: recommend(profile),
+      suppressWrite: !!hp,
+      turnstileToken: turnstile.token,
+    });
   };
 
   const back = () => setStep(s => Math.max(0, s - 1));
@@ -1225,6 +1258,7 @@ function FormFlow({ onComplete, onExit }) {
               </label>
             </div>
             <Honeypot id="fg-company-website" value={hp} onChange={(e) => setHp(e.target.value)} />
+            <TurnstileWidget innerRef={turnstile.ref} />
           </div>
         )}
 
@@ -1233,7 +1267,7 @@ function FormFlow({ onComplete, onExit }) {
           <button onClick={step === 0 ? onExit : back} className="fg-btn-ghost">← {step === 0 ? 'Home' : 'Back'}</button>
           {step < 6
             ? <button onClick={next} disabled={!canNext()} className="fg-btn-dark">Continue</button>
-            : <button onClick={finish} disabled={!consent} className="fg-btn-dark">Get my size</button>
+            : <button onClick={finish} disabled={!consent || !turnstile.ready} className="fg-btn-dark">Get my size</button>
           }
         </div>
       </Container>
@@ -1248,6 +1282,10 @@ const FLAG_BORDER = { warning: '#B85C3C', length: '#1A1A1A', tip: 'rgba(26,26,26
 function ResultScreen({ profile, onRestart }) {
   const r = profile.result;
   const [feedback, setFeedback] = useState(null);
+  // Feedback needs its own token: Turnstile tokens are single-use, and the one
+  // from the wizard was already spent on the profiles insert. Declared above
+  // the early return below to keep hook order stable.
+  const turnstile = useTurnstile();
 
   if (!r) return (
     <Container style={{ paddingTop: 'var(--space-9)', paddingBottom: 'var(--space-9)' }}>
@@ -1272,7 +1310,7 @@ function ResultScreen({ profile, onRestart }) {
       target_brand: profile.targetBrand,
       recommended,
       confidence: r.confidence,
-    }, `fg:feedback:${rid()}`);
+    }, `fg:feedback:${rid()}`, turnstile.token);
   };
 
   return (
@@ -1334,9 +1372,10 @@ function ResultScreen({ profile, onRestart }) {
                 <p style={{ fontFamily: 'var(--font-body)', fontSize: 13, color: 'var(--color-text-secondary)', marginBottom: 'var(--space-5)', lineHeight: 1.6 }}>
                   Your gut check — based on your body knowledge, before trying it.
                 </p>
+                <TurnstileWidget innerRef={turnstile.ref} />
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, maxWidth: 400 }}>
-                  <button onClick={() => submitFeedback(true)}  className="fg-btn-dark">Yes, accurate</button>
-                  <button onClick={() => submitFeedback(false)} className="fg-btn-outline">No, it's off</button>
+                  <button onClick={() => submitFeedback(true)}  disabled={!turnstile.ready} className="fg-btn-dark">Yes, accurate</button>
+                  <button onClick={() => submitFeedback(false)} disabled={!turnstile.ready} className="fg-btn-outline">No, it's off</button>
                 </div>
               </>
             )}
@@ -1731,14 +1770,15 @@ function ContactForm() {
   const [sent, setSent] = useState(false);
   const [hp, setHp] = useState('');
   const [cooling, beginCooldown] = useCooldown('contact');
+  const turnstile = useTurnstile();
   const upd = (k) => (e) => setState(s => ({ ...s, [k]: e.target.value }));
-  const ready = state.name && state.email && state.topic && state.message && cooling <= 0;
+  const ready = state.name && state.email && state.topic && state.message && cooling <= 0 && turnstile.ready;
   const submit = () => {
     // Honeypot tripped: drop the submission entirely — no Supabase write, no
     // local record — but show the same confirmation, so a bot can't tell it
     // was caught and retry with the field left blank.
     if (hp) { setSent(true); return; }
-    insertRow('contact_messages', { ...state, kind: 'general' }, `fg:contact:${rid()}`);
+    insertRow('contact_messages', { ...state, kind: 'general' }, `fg:contact:${rid()}`, turnstile.token);
     beginCooldown();
     setSent(true);
   };
@@ -1778,6 +1818,7 @@ function ContactForm() {
         <textarea id="contact-message" className="fg-textarea" placeholder="Be specific. We'll be specific back." value={state.message} onChange={upd('message')} />
       </div>
       <Honeypot id="contact-company-website" value={hp} onChange={(e) => setHp(e.target.value)} />
+      <TurnstileWidget innerRef={turnstile.ref} />
       <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginTop: 8, flexWrap: 'wrap' }}>
         <button onClick={submit} disabled={!ready} className="fg-btn-dark">Send →</button>
         <p style={{ fontFamily: 'var(--font-body)', fontSize: 12, color: 'var(--color-text-muted)', margin: 0 }}>
@@ -1840,11 +1881,12 @@ function BrandForm() {
   const [sent, setSent] = useState(false);
   const [hp, setHp] = useState('');
   const [cooling, beginCooldown] = useCooldown('brand');
+  const turnstile = useTurnstile();
   const upd = (k) => (e) => setState(s => ({ ...s, [k]: e.target.value }));
-  const ready = state.brand && state.role && state.category && state.email && cooling <= 0;
+  const ready = state.brand && state.role && state.category && state.email && cooling <= 0 && turnstile.ready;
   const submit = () => {
     if (hp) { setSent(true); return; }   // honeypot — see ContactForm
-    insertRow('brand_inquiries', state, `fg:brand:${rid()}`);
+    insertRow('brand_inquiries', state, `fg:brand:${rid()}`, turnstile.token);
     beginCooldown();
     setSent(true);
   };
@@ -1910,6 +1952,7 @@ function BrandForm() {
         </div>
       </div>
       <Honeypot id="brand-company-website" value={hp} onChange={(e) => setHp(e.target.value)} />
+      <TurnstileWidget innerRef={turnstile.ref} />
       <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginTop: 8, flexWrap: 'wrap' }}>
         <button onClick={submit} disabled={!ready} className="fg-btn-dark">Request an audit →</button>
         <p style={{ fontFamily: 'var(--font-body)', fontSize: 12, color: 'var(--color-text-muted)', margin: 0 }}>
@@ -2057,7 +2100,7 @@ export default function FitseamV2() {
       target_brand: p.targetBrand,
       height: p.height || null,
       result: p.result,
-    }, `fg:profile:${rid()}`);
+    }, `fg:profile:${rid()}`, p.turnstileToken);
   };
 
   const nav = (target) => {

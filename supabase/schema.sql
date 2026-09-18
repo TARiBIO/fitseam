@@ -163,10 +163,29 @@ begin
   end if;
 end $$;
 
--- landing_stories accepts anonymous inserts but nothing in the client writes to
--- it — it is an open write endpoint with no feature behind it. Drop the policy
--- until something actually uses the table.
-drop policy if exists "anon can insert landing_stories" on public.landing_stories;
+-- ─── RLS lockdown ────────────────────────────────────────────────────────────
+-- ⚠️ RUN THIS ONLY AFTER verified-insert IS DEPLOYED AND CONFIRMED WORKING.
+-- It removes the browser's ability to write at all. If the Edge Function is not
+-- live when this runs, every submission on the site silently fails.
+--
+-- After this, the anon role can do exactly two things: call get_size_count(),
+-- and invoke the Edge Function. It has no insert rights and no select rights on
+-- any table. Writes arrive only via verified-insert, which uses the service-role
+-- key and bypasses RLS by design — which is why the table and column
+-- allowlists inside that function are load-bearing. See its header comment.
+
+drop policy if exists "anon can insert profiles"         on public.profiles;
+drop policy if exists "anon can insert feedback"         on public.feedback;
+drop policy if exists "anon can insert landing_stories"  on public.landing_stories;
+drop policy if exists "anon can insert contact_messages" on public.contact_messages;
+drop policy if exists "anon can insert brand_inquiries"  on public.brand_inquiries;
+
+-- RLS stays enabled on all five. With no policies at all, the anon role is
+-- denied by default — that is the intended end state, not an oversight.
+
+-- Verify with:
+--   select tablename, policyname from pg_policies where schemaname = 'public';
+-- Expect zero rows.
 
 -- ─── Public counter RPC ──────────────────────────────────────────────────────
 -- Returns the total number of sizings without exposing any row content.

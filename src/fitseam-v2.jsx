@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { supabase, hasSupabase, SUPABASE_URL, SUPABASE_ANON_KEY } from "./supabase";
 import { useTurnstile, TurnstileWidget, hasTurnstile } from "./turnstile";
+import { pageForPath, pathForPage, titleForPage, canonicalForPage, isTransient, DEFAULT_PAGE } from "./routes";
 
 // ─── Persistence ─────────────────────────────────────────────────────────────
 // Supabase when env vars are set; localStorage otherwise (or in addition,
@@ -70,6 +71,64 @@ function Honeypot({ id, value, onChange }) {
 }
 
 const cooldownNote = (ms) => `Just a moment — you can send again in ${Math.ceil(ms / 1000)}s.`;
+
+// Where we reached on a failed send. Both addresses are in the legal pages
+// already, so this is not a new promise — it is the route that still works when
+// the database does not.
+export const FALLBACK_EMAIL = 'hello@fitseam.co';
+
+/**
+ * Submission state for a form that writes to the backend.
+ *
+ * Every form used to call insertRow fire-and-forget and render its success
+ * screen unconditionally. insertRow returns { ok, reason } and nothing read it,
+ * so a failed write still told the visitor "Thank you — we've got it. Expect to
+ * hear from us within a working day." That is a promise the system cannot keep,
+ * invisible on both sides — the only trace was a console warning on a device we
+ * never see.
+ *
+ * `offline` counts as a failure here, deliberately. It means Supabase is not
+ * configured at all and the row exists only in this browser's localStorage.
+ * Nobody at Fitseam received anything, so we must not say we did. It also makes
+ * a misconfigured deployment loud on the very first submission instead of
+ * silently swallowing real messages.
+ *
+ * Returns [status, send] where status is 'idle' | 'sending' | 'sent' | 'failed'.
+ */
+function useSubmission() {
+  const [status, setStatus] = useState('idle');
+  const send = async (write) => {
+    setStatus('sending');
+    let res;
+    try {
+      res = await write();
+    } catch (e) {
+      console.warn('[fitseam] submission threw:', e?.message ?? e);
+      res = { ok: false, reason: 'threw' };
+    }
+    const delivered = !!res?.ok && !res.offline;
+    setStatus(delivered ? 'sent' : 'failed');
+    return delivered;
+  };
+  return [status, send];
+}
+
+/** Shown in place of a success screen when the write did not land. */
+function SendFailed({ what }) {
+  return (
+    <div role="alert" style={{ border: `1px solid ${RUST}`, padding: '16px 18px', marginBottom: 20 }}>
+      <p style={{ fontFamily: 'var(--font-body)', fontSize: 14, fontWeight: 500, color: RUST, margin: '0 0 6px' }}>
+        We couldn't send that.
+      </p>
+      <p style={{ fontFamily: 'var(--font-body)', fontSize: 14, lineHeight: 1.6, color: 'var(--color-text-secondary)', margin: 0 }}>
+        Something went wrong on our end and your {what} has <strong>not</strong> reached us — nothing was saved.
+        Your details are still in the form below, so nothing is lost. Please try again, or email us
+        directly at <a href={`mailto:${FALLBACK_EMAIL}`} className="fg-link-accent">{FALLBACK_EMAIL}</a> and
+        we'll pick it up there.
+      </p>
+    </div>
+  );
+}
 
 // All writes go through the verified-insert Edge Function, which checks the
 // Turnstile token server-side and inserts with the service-role key. The
@@ -164,7 +223,7 @@ async function fetchRemoteCount() {
 // brands-sources.md, but has deliberately not been merged here yet — see the
 // "partial correction is unsafe" note in that file.
 
-const BRANDS = {
+export const BRANDS = {
   jeans: {
     "Levi's": {
       sizeSystem: 'denim-inch', measurementType: 'unknown',
@@ -311,11 +370,11 @@ const BRANDS = {
 // directly would treat `sizeSystem`/`measurementType`/etc. as size keys, which
 // is precisely what closest() and getBetween() would choke on. Read the
 // metadata fields off BRANDS[category][brand] directly.
-const chartOf = (category, brand) => BRANDS[category]?.[brand]?.sizes ?? null;
+export const chartOf = (category, brand) => BRANDS[category]?.[brand]?.sizes ?? null;
 
 // ─── Recommendation engine ────────────────────────────────────────────────────
 
-const closest = (chart, key, val) => {
+export const closest = (chart, key, val) => {
   let best = null, bestDiff = Infinity;
   for (const [size, m] of Object.entries(chart)) {
     const d = Math.abs((m[key] ?? Infinity) - val);
@@ -324,22 +383,30 @@ const closest = (chart, key, val) => {
   return { size: best, diff: bestDiff };
 };
 
-const getBetween = (chart, key, val) => {
+// Returns the two sizes a measurement genuinely falls between, or null.
+//
+// Both comparisons are STRICT. A measurement landing exactly on a chart value
+// is not between sizes — it is that size, and closest() returns it with diff 0.
+// With inclusive bounds the result screen showed a confident size alongside a
+// "you fall between two sizes" warning contradicting it; worse, because the
+// matched size came back as the larger end, an exact S and an exact M both
+// reported {S, M}, giving two users a full size apart identical copy.
+export const getBetween = (chart, key, val) => {
   const entries = Object.entries(chart).sort((a, b) => (a[1][key] ?? 0) - (b[1][key] ?? 0));
   for (let i = 0; i < entries.length - 1; i++) {
-    if (val >= entries[i][1][key] && val <= entries[i + 1][1][key])
+    if (val > entries[i][1][key] && val < entries[i + 1][1][key])
       return { smaller: entries[i][0], larger: entries[i + 1][0] };
   }
   return null;
 };
 
-const impliedFor = (category, brand, size) => {
+export const impliedFor = (category, brand, size) => {
   if (category === 'jeans') return chartOf('jeans', brand)?.[size] ?? null;
   if (category === 'dress') return chartOf('dress', brand)?.[size] ?? null;
   return null;
 };
 
-const blendValues = (measured, ...implied) => {
+export const blendValues = (measured, ...implied) => {
   const all = [measured, ...implied].filter(Boolean);
   if (all.length === 1) return measured;
   const keys = Object.keys(measured);
@@ -351,17 +418,23 @@ const blendValues = (measured, ...implied) => {
   return result;
 };
 
-const prefOffset = (preference) =>
+export const prefOffset = (preference) =>
   preference === 'fitted' ? -2 : preference === 'relaxed' ? 2 : 0;
 
-const anchorConfidence = (n, variance) => {
+export const anchorConfidence = (n, variance) => {
   if (n >= 3 && variance <= 4) return { level: 'High', note: 'Your size signals agree closely across brands.' };
   if (n >= 2 && variance <= 6) return { level: 'Medium-High', note: 'Your anchors broadly agree — a confident estimate.' };
+  // Two or more anchors that disagree by more than 6cm. They WERE used — the
+  // blend simply has a wide spread — so report the spread. This branch has to
+  // sit above the n === 1 test: without it these cases fell through to the
+  // final return, which told a user who had supplied three anchors that the
+  // estimate was "based on your measurements alone".
+  if (n >= 2) return { level: 'Medium', note: `Your anchors disagree by about ${Math.round(variance)}cm, so this leans more on your own measurements. Worth checking the sizes you entered.` };
   if (n === 1) return { level: 'Medium', note: 'Based on one anchor plus your measurements.' };
   return { level: 'Medium', note: 'Based on your measurements alone. More anchors sharpen this.' };
 };
 
-function recommend({ category, measurements: m, anchors = [], preference = 'regular', targetBrand, shape, height }) {
+export function recommend({ category, measurements: m, anchors = [], preference = 'regular', targetBrand, shape, height }) {
   const validAnchors = anchors.filter(a => a.brand && a.size);
   const h = parseFloat(height) || 0;
   const off = prefOffset(preference);
@@ -624,7 +697,15 @@ const GLOBAL_CSS = `
   .fg-header-bar { display: flex; align-items: center; justify-content: space-between; height: 72px; }
   .fg-nav { display: flex; align-items: center; gap: 28px; }
 
+  .fg-footer      { padding: 64px 0 48px; }
   .fg-footer-grid { display: grid; grid-template-columns: 2fr 1fr 1fr 1fr; gap: 48px; margin-bottom: 48px; }
+  .fg-footer-col  { display: flex; flex-direction: column; gap: 10px; align-items: flex-start; }
+  .fg-footer-col .fg-link { padding: 0; }
+  .fg-footer-wordmark { font-family: var(--font-display); font-size: 32px; }
+  .fg-footer-tagline  { font-family: var(--font-display); font-style: italic; font-size: 18px;
+    color: ${RUST}; margin: 8px 0 0; }
+  .fg-footer-bottom { border-top: 1px solid var(--color-border-light); padding-top: 24px;
+    display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 16px; }
 
   .fg-press-grid  { display: grid; grid-template-columns: 180px 1fr auto; gap: 32px; align-items: baseline;
     padding: 28px 0; border-top: 1px solid var(--color-border-light); }
@@ -662,7 +743,31 @@ const GLOBAL_CSS = `
     .fg-two-col, .fg-anchor-row, .fg-story-grid, .fg-shape-grid { grid-template-columns: 1fr; gap: 24px; }
     .fg-numbers-strip { grid-template-columns: 1fr; gap: 28px; padding: 24px 0; }
     .fg-numbers-strip .fg-stat { font-size: 44px; }
-    .fg-footer-grid { grid-template-columns: 1fr; gap: 32px; }
+    /* Footer on a phone. Stacking all four blocks in one column ran the footer
+       past a full viewport height (819px on a 375x812 screen) while leaving
+       most of the width empty, so the link groups sit two-up and the brand
+       block spans the row above them. Links get vertical padding instead of a
+       flex gap: the same visual rhythm, but the tap target is the whole row
+       rather than a 19px strip of text. */
+    .fg-footer { padding: 40px 0 32px; }
+    .fg-footer-grid { grid-template-columns: 1fr 1fr; gap: 28px 24px; margin-bottom: 28px; }
+    .fg-footer-brand { grid-column: 1 / -1; }
+    /* Placed explicitly rather than left to auto-flow. Company has five links
+       against Product's three, so flowing them left it a dead patch under
+       Product and an empty half-row beside Follow. Company spans both rows on
+       the right; Product and Follow stack down the left. */
+    .fg-footer-product { grid-column: 1; grid-row: 2; }
+    .fg-footer-company { grid-column: 2; grid-row: 2 / span 2; }
+    .fg-footer-follow  { grid-column: 1; grid-row: 3; }
+    .fg-footer-brand svg { height: 52px; width: auto; }
+    .fg-footer-wordmark { font-size: 26px; }
+    .fg-footer-tagline { font-size: 16px; }
+    .fg-footer-col { gap: 0; }
+    /* display:block matters — the Follow items are spans, and vertical padding
+       does not grow an inline box, so without it they keep a 21px tap target
+       while the button rows get 39px. */
+    .fg-footer-col .fg-link { display: block; font-size: 14px; padding: 10px 0; }
+    .fg-footer-bottom { gap: 10px; }
     .fg-prose h3 { font-size: 22px; margin: 36px 0 12px; }
     .fg-press-grid { grid-template-columns: 1fr; gap: 8px; padding: 20px 0; }
     .fg-press-grid .fg-press-meta { order: -1; }
@@ -785,35 +890,43 @@ function Footer({ onNav }) {
   const linkBtn = (label, page) => (
     <button type="button" onClick={() => onNav(page)}
       className="fg-link"
-      style={{ background: 'none', border: 'none', padding: 0, cursor: 'pointer', font: 'inherit', textAlign: 'left' }}>
+      // Neither padding nor font is set here, and both omissions are load
+      // bearing: an inline style beats the media query, so the mobile
+      // breakpoint could not grow these into a tap target or resize them.
+      // `font: inherit` in particular reset font-size, which is why these
+      // buttons rendered at 16px beside the 13px Follow spans. .fg-link
+      // supplies the family and size; the rules below reset the button chrome.
+      style={{ background: 'none', border: 'none', cursor: 'pointer', textAlign: 'left' }}>
       {label}
     </button>
   );
+  // Sizing and spacing live in CSS rather than inline style objects so the
+  // mobile breakpoint can override them — an inline style would win over the
+  // media query and there would be no way to retune the footer for a phone.
   const colHeader = { fontFamily: 'var(--font-body)', fontSize: 11, fontWeight: 500, letterSpacing: '.1em', textTransform: 'uppercase', color: 'var(--color-text-muted)', margin: '0 0 16px' };
-  const colWrap = { display: 'flex', flexDirection: 'column', gap: 10 };
   const bottom = { fontFamily: 'var(--font-body)', fontSize: 12, fontWeight: 300, letterSpacing: '.06em', color: 'var(--color-text-muted)', margin: 0 };
   return (
-    <footer style={{ borderTop: `1px solid ${INK}`, marginTop: 'auto', padding: '64px 0 48px' }}>
+    <footer className="fg-footer" style={{ borderTop: `1px solid ${INK}`, marginTop: 'auto' }}>
       <Container wide>
         <div className="fg-footer-grid">
-          <div>
+          <div className="fg-footer-brand">
             <div style={{ display: 'flex', alignItems: 'center', gap: 14, color: INK }}>
               <FitseamLogo height={68} />
-              <span style={{ fontFamily: 'var(--font-display)', fontSize: 32 }}>Fitseam</span>
+              <span className="fg-footer-wordmark">Fitseam</span>
             </div>
-            <p style={{ fontFamily: 'var(--font-display)', fontStyle: 'italic', fontSize: 18, color: RUST, margin: '8px 0 0' }}>Built for every body.</p>
+            <p className="fg-footer-tagline">Built for every body.</p>
           </div>
-          <div>
+          <div className="fg-footer-product">
             <p style={colHeader}>Product</p>
-            <div style={colWrap}>
+            <div className="fg-footer-col">
               {linkBtn('Find my size', 'form')}
               {linkBtn('About', 'about')}
               {linkBtn('For brands', 'brands')}
             </div>
           </div>
-          <div>
+          <div className="fg-footer-company">
             <p style={colHeader}>Company</p>
-            <div style={colWrap}>
+            <div className="fg-footer-col">
               {linkBtn('Contact', 'contact')}
               {linkBtn('Terms', 'terms')}
               {linkBtn('Privacy', 'privacy')}
@@ -821,16 +934,16 @@ function Footer({ onNav }) {
               {linkBtn('Refunds', 'refunds')}
             </div>
           </div>
-          <div>
+          <div className="fg-footer-follow">
             <p style={colHeader}>Follow</p>
-            <div style={colWrap}>
+            <div className="fg-footer-col">
               <span className="fg-link">Instagram</span>
               <span className="fg-link">TikTok</span>
               <span className="fg-link">Twitter / X</span>
             </div>
           </div>
         </div>
-        <div style={{ borderTop: '1px solid var(--color-border-light)', paddingTop: 24, display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 16 }}>
+        <div className="fg-footer-bottom">
           <p style={bottom}>
             © 2026 Fitseam. Are you a brand?{' '}
             <button type="button" onClick={() => onNav('brands')} className="fg-link-accent"
@@ -1770,17 +1883,24 @@ function ContactForm() {
   const [sent, setSent] = useState(false);
   const [hp, setHp] = useState('');
   const [cooling, beginCooldown] = useCooldown('contact');
+  const [status, send] = useSubmission();
   const turnstile = useTurnstile();
   const upd = (k) => (e) => setState(s => ({ ...s, [k]: e.target.value }));
-  const ready = state.name && state.email && state.topic && state.message && cooling <= 0 && turnstile.ready;
-  const submit = () => {
+  const ready = state.name && state.email && state.topic && state.message && cooling <= 0
+    && turnstile.ready && status !== 'sending';
+  const submit = async () => {
     // Honeypot tripped: drop the submission entirely — no Supabase write, no
     // local record — but show the same confirmation, so a bot can't tell it
     // was caught and retry with the field left blank.
     if (hp) { setSent(true); return; }
-    insertRow('contact_messages', { ...state, kind: 'general' }, `fg:contact:${rid()}`, turnstile.token);
     beginCooldown();
-    setSent(true);
+    // Only claim we have the message once the write actually landed. On
+    // failure the form stays on screen with the user's text intact and
+    // SendFailed offers the email route instead.
+    const delivered = await send(() =>
+      insertRow('contact_messages', { ...state, kind: 'general' }, `fg:contact:${rid()}`, turnstile.token));
+    if (delivered) setSent(true);
+    else turnstile.reset(); // the token is spent either way — get a fresh one
   };
   if (sent) return (
     <div style={{ borderTop: `1px solid ${INK}`, paddingTop: 32 }}>
@@ -1792,6 +1912,7 @@ function ContactForm() {
   );
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 20, maxWidth: 560 }}>
+      {status === 'failed' && <SendFailed what="message" />}
       <div className="fg-anchor-row">
         <div>
           <label className="fg-label" htmlFor="contact-name">Your name</label>
@@ -1820,7 +1941,9 @@ function ContactForm() {
       <Honeypot id="contact-company-website" value={hp} onChange={(e) => setHp(e.target.value)} />
       <TurnstileWidget innerRef={turnstile.ref} />
       <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginTop: 8, flexWrap: 'wrap' }}>
-        <button onClick={submit} disabled={!ready} className="fg-btn-dark">Send →</button>
+        <button onClick={submit} disabled={!ready} className="fg-btn-dark">
+          {status === 'sending' ? 'Sending…' : status === 'failed' ? 'Try again →' : 'Send →'}
+        </button>
         <p style={{ fontFamily: 'var(--font-body)', fontSize: 12, color: 'var(--color-text-muted)', margin: 0 }}>
           {cooling > 0 ? cooldownNote(cooling) : 'We use your email only to reply.'}
         </p>
@@ -1881,14 +2004,20 @@ function BrandForm() {
   const [sent, setSent] = useState(false);
   const [hp, setHp] = useState('');
   const [cooling, beginCooldown] = useCooldown('brand');
+  const [status, send] = useSubmission();
   const turnstile = useTurnstile();
   const upd = (k) => (e) => setState(s => ({ ...s, [k]: e.target.value }));
-  const ready = state.brand && state.role && state.category && state.email && cooling <= 0 && turnstile.ready;
-  const submit = () => {
+  const ready = state.brand && state.role && state.category && state.email && cooling <= 0
+    && turnstile.ready && status !== 'sending';
+  const submit = async () => {
     if (hp) { setSent(true); return; }   // honeypot — see ContactForm
-    insertRow('brand_inquiries', state, `fg:brand:${rid()}`, turnstile.token);
     beginCooldown();
-    setSent(true);
+    // "You'll hear back from the founder within two working days" is only true
+    // if the inquiry reached us. See useSubmission.
+    const delivered = await send(() =>
+      insertRow('brand_inquiries', state, `fg:brand:${rid()}`, turnstile.token));
+    if (delivered) setSent(true);
+    else turnstile.reset();
   };
   if (sent) return (
     <div style={{ borderTop: `1px solid ${INK}`, paddingTop: 32 }}>
@@ -1900,6 +2029,7 @@ function BrandForm() {
   );
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 20, maxWidth: 640 }}>
+      {status === 'failed' && <SendFailed what="inquiry" />}
       <div className="fg-anchor-row">
         <div>
           <label className="fg-label" htmlFor="brand-name">Brand name</label>
@@ -1954,7 +2084,9 @@ function BrandForm() {
       <Honeypot id="brand-company-website" value={hp} onChange={(e) => setHp(e.target.value)} />
       <TurnstileWidget innerRef={turnstile.ref} />
       <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginTop: 8, flexWrap: 'wrap' }}>
-        <button onClick={submit} disabled={!ready} className="fg-btn-dark">Request an audit →</button>
+        <button onClick={submit} disabled={!ready} className="fg-btn-dark">
+          {status === 'sending' ? 'Sending…' : status === 'failed' ? 'Try again →' : 'Request an audit →'}
+        </button>
         <p style={{ fontFamily: 'var(--font-body)', fontSize: 12, color: 'var(--color-text-muted)', margin: 0 }}>
           {cooling > 0 ? cooldownNote(cooling) : 'No marketing follow-up. One reply, from a human.'}
         </p>
@@ -2063,11 +2195,58 @@ function BrandsPage() {
 // ─── App ──────────────────────────────────────────────────────────────────────
 
 export default function FitseamV2() {
-  const [page, setPage] = useState('home');
+  // Page state is mirrored into the address bar so every page is a real,
+  // linkable, indexable URL. See routes.js for why that was worth doing.
+  const [page, setPage] = useState(() => pageForPath(window.location.pathname));
   const [profile, setProfile] = useState(null);
   const [count, setCount] = useState(() => local.readInt('fg:count', 0));
 
   useEffect(() => { window.scrollTo(0, 0); }, [page]);
+
+  // Keep the document head in step with the page. Without this every route
+  // would share the landing page's title and canonical, which is the same as
+  // having no routes at all as far as a crawler is concerned.
+  useEffect(() => {
+    document.title = titleForPage(page);
+    let link = document.querySelector('link[rel="canonical"]');
+    if (!link) {
+      link = document.createElement('link');
+      link.setAttribute('rel', 'canonical');
+      document.head.appendChild(link);
+    }
+    link.setAttribute('href', canonicalForPage(page));
+  }, [page]);
+
+  // Back/forward buttons.
+  useEffect(() => {
+    const onPop = () => {
+      const next = pageForPath(window.location.pathname);
+      // Nothing to render for /your-size on a fresh history entry.
+      setPage(isTransient(next) && !profile ? DEFAULT_PAGE : next);
+    };
+    window.addEventListener('popstate', onPop);
+    return () => window.removeEventListener('popstate', onPop);
+  }, [profile]);
+
+  // A cold load of a transient route (someone bookmarked or shared their
+  // result) has no profile in memory, so rewrite it to home rather than
+  // rendering a blank page.
+  useEffect(() => {
+    const here = window.location.pathname;
+    const resolved = pageForPath(here);
+    // A transient route on a cold load has nothing to render, so it goes home.
+    const target = isTransient(resolved) && !profile ? DEFAULT_PAGE : resolved;
+    // Normalise the address bar to the route's canonical path. This covers a
+    // trailing slash (/terms/ → /terms) and a path matching no route at all,
+    // which resolves to home — the host serves index.html for everything, so
+    // the app is its own 404 handler and the URL should say so.
+    const canonical = pathForPage(target);
+    if (canonical !== here) window.history.replaceState({ page: target }, '', canonical);
+    if (target !== resolved) setPage(target);
+    // Intentionally mount-only: this is the cold-load guard, and re-running it
+    // when `profile` arrives would bounce the user off their own result.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Prefer the live remote count on mount; fall back to whatever we cached locally.
   useEffect(() => {
@@ -2084,27 +2263,39 @@ export default function FitseamV2() {
 
   const onProfileComplete = (p) => {
     setProfile(p);
-    setPage('result');
+    nav('result');
     // Honeypot tripped, or a sizing was submitted in the last 30s: show the
     // result but don't write. The counter is driven off this table, so an
     // unthrottled write here inflates a public-facing number.
     if (p.suppressWrite || cooldownLeft('profile') > 0) return;
     startCooldown('profile');
-    setCount(c => { const n = c + 1; local.writeInt('fg:count', n); return n; });
-    insertRow('profiles', {
-      category: p.category,
-      measurements: p.measurements,
-      shape: p.shape || null,
-      anchors: p.anchors,
-      preference: p.preference,
-      target_brand: p.targetBrand,
-      height: p.height || null,
-      result: p.result,
-    }, `fg:profile:${rid()}`, p.turnstileToken);
+    // The counter is a public-facing claim about how many people we have sized,
+    // and it used to increment here — before the insert, regardless of whether
+    // it succeeded. With every write failing that meant a number climbing in
+    // the browser while the table stayed empty. Only count a row we actually
+    // wrote. The result itself is computed client-side and is shown either way.
+    (async () => {
+      const res = await insertRow('profiles', {
+        category: p.category,
+        measurements: p.measurements,
+        shape: p.shape || null,
+        anchors: p.anchors,
+        preference: p.preference,
+        target_brand: p.targetBrand,
+        height: p.height || null,
+        result: p.result,
+      }, `fg:profile:${rid()}`, p.turnstileToken);
+      if (res?.ok && !res.offline) {
+        setCount(c => { const n = c + 1; local.writeInt('fg:count', n); return n; });
+      }
+    })();
   };
 
+  // The single entry point for changing page. Everything routes through here so
+  // the URL can never drift out of sync with what is on screen.
   const nav = (target) => {
-    if (target === 'form') { setPage('form'); return; }
+    if (target === page) return;
+    window.history.pushState({ page: target }, '', pathForPage(target));
     setPage(target);
   };
 
@@ -2113,9 +2304,9 @@ export default function FitseamV2() {
       <style>{GLOBAL_CSS}</style>
       <Header count={count} onNav={nav} />
       <div style={{ flex: 1 }}>
-        {page === 'home'    && <Landing count={count} onStart={() => setPage('form')} />}
-        {page === 'form'    && <FormFlow onExit={() => setPage('home')} onComplete={onProfileComplete} />}
-        {page === 'result'  && profile && <ResultScreen profile={profile} onRestart={() => setPage('form')} />}
+        {page === 'home'    && <Landing count={count} onStart={() => nav('form')} />}
+        {page === 'form'    && <FormFlow onExit={() => nav('home')} onComplete={onProfileComplete} />}
+        {page === 'result'  && profile && <ResultScreen profile={profile} onRestart={() => nav('form')} />}
         {page === 'about'   && <AboutPage   onNav={nav} />}
         {page === 'privacy' && <PrivacyPage onNav={nav} />}
         {page === 'terms'   && <TermsPage   onNav={nav} />}

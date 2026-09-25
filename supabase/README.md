@@ -56,11 +56,16 @@ supabase functions deploy verified-insert
 ### 5. Confirm it works *before* locking down
 
 Submit the contact form on the deployed site and check a row lands in
-`contact_messages`. Then:
+`contact_messages`.
 
-```sh
-supabase functions logs verified-insert
-```
+Function logs live in the dashboard — the CLI has no `functions logs`
+subcommand (checked against CLI 2.117.0):
+
+<https://supabase.com/dashboard/project/_/functions/verified-insert/logs>
+
+A rejected write logs `Turnstile rejected: [ ... ]` with Cloudflare's error
+code. `invalid-input-secret` means `TURNSTILE_SECRET_KEY` is wrong or still a
+placeholder; `invalid-input-response` means the token itself was bad.
 
 ### 6. Lock down RLS
 

@@ -8,7 +8,7 @@
     <path d="M12 82 Q4 84 4 78 Q4 73 10 74" stroke="#1A1A1A" stroke-width="0.7" fill="none" stroke-linecap="round"/>
   </g>
   <text x="380" y="220" font-family="'Instrument Serif', 'Times New Roman', serif" font-style="italic" font-size="30" fill="#B85C3C">Fit intelligence for real bodies</text>
-  <text x="380" y="360" font-family="'Instrument Serif', 'Times New Roman', serif" font-size="110" fill="#1A1A1A">Your size didn’t change.</text>
-  <text x="380" y="480" font-family="'Instrument Serif', 'Times New Roman', serif" font-style="italic" font-size="110" fill="#1A1A1A">The clothes did.</text>
+  <text x="380" y="360" font-family="'Instrument Serif', 'Times New Roman', serif" font-size="92" fill="#1A1A1A">Your size didn’t change.</text>
+  <text x="380" y="460" font-family="'Instrument Serif', 'Times New Roman', serif" font-style="italic" font-size="92" fill="#1A1A1A">The clothes did.</text>
   <text x="380" y="560" font-family="'DM Sans', 'Helvetica Neue', sans-serif" font-size="22" fill="#1A1A1A" opacity="0.55">FITSEAM · fitseam.co</text>
 </svg>

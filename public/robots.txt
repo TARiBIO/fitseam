@@ -1,3 +1,8 @@
 # https://www.robotstxt.org/robotstxt.html
 User-agent: *
 Disallow:
+
+# /your-size renders from in-memory state only — a crawler gets redirected home.
+Disallow: /your-size
+
+Sitemap: https://www.fitseam.co/sitemap.xml

@@ -1,6 +1,8 @@
 import { useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "motion/react";
-import { supabase, hasSupabase } from "./supabase";
+import { supabase, hasSupabase, SUPABASE_URL, SUPABASE_ANON_KEY } from "./supabase";
+import { useTurnstile, TurnstileWidget, hasTurnstile } from "./turnstile";
+import { pageForPath, pathForPage, titleForPage, canonicalForPage, isTransient, DEFAULT_PAGE } from "./routes";
 
 // ─── Persistence ─────────────────────────────────────────────────────────────
 // Supabase when env vars are set; localStorage otherwise (or in addition,
@@ -24,14 +26,144 @@ const local = {
   },
 };
 
-async function insertRow(table, row, localKey) {
+// ─── Abuse speed bumps ───────────────────────────────────────────────────────
+// ⚠️ These are NOT a security boundary. The Supabase anon key ships in the
+// client bundle, so anyone can POST straight to the REST endpoint and skip all
+// of this. Every table's RLS policy is `with check (true)` — there is no
+// server-side rate limit, size cap, or abuse check anywhere. What follows stops
+// casual bots and accidental double-submits, nothing more. See the header of
+// supabase/schema.sql for what still needs doing server-side.
+
+const SUBMIT_COOLDOWN_MS = 30_000;
+
+const cooldownLeft = (name) =>
+  Math.max(0, local.readInt(`fg:cooldown:${name}`, 0) - Date.now());
+
+const startCooldown = (name) =>
+  local.writeInt(`fg:cooldown:${name}`, Date.now() + SUBMIT_COOLDOWN_MS);
+
+// Returns [msRemaining, begin]. The interval only runs while a cooldown is
+// active, so idle forms cost nothing.
+function useCooldown(name) {
+  const [left, setLeft] = useState(() => cooldownLeft(name));
+  const active = left > 0;
+  useEffect(() => {
+    if (!active) return undefined;
+    const t = setInterval(() => setLeft(cooldownLeft(name)), 500);
+    return () => clearInterval(t);
+  }, [active, name]);
+  return [left, () => { startCooldown(name); setLeft(SUBMIT_COOLDOWN_MS); }];
+}
+
+// Honeypot input. Positioned off-screen rather than `display:none`: headless
+// browsers that compute styles skip genuinely hidden fields, while naive
+// form-fillers populate every input they can parse out of the HTML. Off-screen
+// catches both. tabIndex={-1} keeps it out of the keyboard path and
+// aria-hidden keeps it away from screen readers, so it costs no accessibility.
+function Honeypot({ id, value, onChange }) {
+  return (
+    <div aria-hidden="true" style={{ position: 'absolute', left: -9999, width: 1, height: 1, overflow: 'hidden' }}>
+      <label htmlFor={id}>Leave this field empty</label>
+      <input id={id} name="company_website" type="text" tabIndex={-1}
+        autoComplete="off" value={value} onChange={onChange} />
+    </div>
+  );
+}
+
+const cooldownNote = (ms) => `Just a moment — you can send again in ${Math.ceil(ms / 1000)}s.`;
+
+// Where we reached on a failed send. Both addresses are in the legal pages
+// already, so this is not a new promise — it is the route that still works when
+// the database does not.
+export const FALLBACK_EMAIL = 'hello@fitseam.co';
+
+/**
+ * Submission state for a form that writes to the backend.
+ *
+ * Every form used to call insertRow fire-and-forget and render its success
+ * screen unconditionally. insertRow returns { ok, reason } and nothing read it,
+ * so a failed write still told the visitor "Thank you — we've got it. Expect to
+ * hear from us within a working day." That is a promise the system cannot keep,
+ * invisible on both sides — the only trace was a console warning on a device we
+ * never see.
+ *
+ * `offline` counts as a failure here, deliberately. It means Supabase is not
+ * configured at all and the row exists only in this browser's localStorage.
+ * Nobody at Fitseam received anything, so we must not say we did. It also makes
+ * a misconfigured deployment loud on the very first submission instead of
+ * silently swallowing real messages.
+ *
+ * Returns [status, send] where status is 'idle' | 'sending' | 'sent' | 'failed'.
+ */
+function useSubmission() {
+  const [status, setStatus] = useState('idle');
+  const send = async (write) => {
+    setStatus('sending');
+    let res;
+    try {
+      res = await write();
+    } catch (e) {
+      console.warn('[fitseam] submission threw:', e?.message ?? e);
+      res = { ok: false, reason: 'threw' };
+    }
+    const delivered = !!res?.ok && !res.offline;
+    setStatus(delivered ? 'sent' : 'failed');
+    return delivered;
+  };
+  return [status, send];
+}
+
+/** Shown in place of a success screen when the write did not land. */
+function SendFailed({ what }) {
+  return (
+    <div role="alert" style={{ border: `1px solid ${RUST}`, padding: '16px 18px', marginBottom: 20 }}>
+      <p style={{ fontFamily: 'var(--font-body)', fontSize: 14, fontWeight: 500, color: RUST, margin: '0 0 6px' }}>
+        We couldn't send that.
+      </p>
+      <p style={{ fontFamily: 'var(--font-body)', fontSize: 14, lineHeight: 1.6, color: 'var(--color-text-secondary)', margin: 0 }}>
+        Something went wrong on our end and your {what} has <strong>not</strong> reached us — nothing was saved.
+        Your details are still in the form below, so nothing is lost. Please try again, or email us
+        directly at <a href={`mailto:${FALLBACK_EMAIL}`} className="fg-link-accent">{FALLBACK_EMAIL}</a> and
+        we'll pick it up there.
+      </p>
+    </div>
+  );
+}
+
+// All writes go through the verified-insert Edge Function, which checks the
+// Turnstile token server-side and inserts with the service-role key. The
+// browser has no insert rights of its own — the anon role's insert policies are
+// dropped in schema.sql, so a direct supabase.from(table).insert() would now be
+// rejected by RLS.
+async function insertRow(table, row, localKey, turnstileToken) {
   local.save(localKey, row);
-  if (!hasSupabase) return;
+  if (!hasSupabase) return { ok: true, offline: true };
+
+  if (hasTurnstile && !turnstileToken) {
+    console.warn(`[fitseam] refusing to write ${table} without a Turnstile token`);
+    return { ok: false, reason: 'no-token' };
+  }
+
   try {
-    const { error } = await supabase.from(table).insert(row);
-    if (error) console.warn(`[fitseam] Supabase insert failed (${table}):`, error.message);
+    const res = await fetch(`${SUPABASE_URL}/functions/v1/verified-insert`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        // The anon key authenticates the call to the function itself. It grants
+        // nothing on its own now that the insert policies are gone.
+        apikey: SUPABASE_ANON_KEY,
+        Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+      },
+      body: JSON.stringify({ table, row, turnstileToken }),
+    });
+    if (!res.ok) {
+      console.warn(`[fitseam] verified-insert rejected (${table}):`, res.status);
+      return { ok: false, reason: `http-${res.status}` };
+    }
+    return { ok: true };
   } catch (e) {
-    console.warn(`[fitseam] Supabase insert threw (${table}):`, e?.message ?? e);
+    console.warn(`[fitseam] verified-insert threw (${table}):`, e?.message ?? e);
+    return { ok: false, reason: 'network' };
   }
 }
 
@@ -49,49 +181,200 @@ async function fetchRemoteCount() {
 }
 
 // ─── Brand database ───────────────────────────────────────────────────────────
+//
+// ⚠️ UNVERIFIED DATA. As of 2026-09-17 these numbers are believed to be synthetic
+// placeholders, not transcribed from any brand's published size guide. Tells:
+// hip-minus-waist is a perfect constant within every jeans brand, sizes advance
+// in near-perfect arithmetic steps, and two brand pairs are byte-identical
+// (PrettyLittleThing == Boohoo, Zara == Mango).
+//
+// Two brands were spot-checked against live sources and both were wrong by more
+// than the gap between adjacent sizes — Good American by ~4 whole size steps
+// (it is a US-sized brand carrying UK measurements here). Recommendations are
+// currently off by multiple sizes, not marginally inaccurate.
+//
+// Do not patch individual brands: recommend() averages anchor brands together
+// via blendValues(), so mixing corrected and synthetic rows corrupts the blend.
+// Correct the dataset as a whole.
+//
+// Status per brand, evidence and sources: ./brands-sources.md
 
-const BRANDS = {
+// Each brand is { sizeSystem, measurementType, source, verified, sizes }.
+//
+//   sizeSystem      the scale the brand's own labels are on. Never normalise a
+//                   brand onto a different scale — doing exactly that is what
+//                   put Good American (US) on UK numbers and left it four size
+//                   steps adrift.
+//                     'UK' | 'US' | 'EU' | 'SA' | 'alpha' | 'denim-inch'
+//
+//   measurementType whether `sizes` holds body measurements or finished-garment
+//                   measurements. recommend() compares charts against the
+//                   user's *body*, so a 'garment' chart is invalid input
+//                   without an ease adjustment.
+//                     'body' | 'garment' | 'unknown'
+//
+//   source          where the brand's real chart lives, for re-verification.
+//   verified        ISO date the numbers in `sizes` were checked against
+//                   `source`. null means the numbers are NOT that chart.
+//
+// measurementType is 'unknown' and verified is null for every brand below,
+// because the stored numbers are still the synthetic placeholders. Where a
+// source URL is filled in, the real chart has been located and transcribed into
+// brands-sources.md, but has deliberately not been merged here yet — see the
+// "partial correction is unsafe" note in that file.
+
+export const BRANDS = {
   jeans: {
-    "Levi's":         { "24":{w:61,h:86},"25":{w:64,h:89},"26":{w:66,h:91},"27":{w:69,h:94},"28":{w:71,h:96},"29":{w:74,h:99},"30":{w:76,h:101},"31":{w:79,h:104},"32":{w:81,h:106},"33":{w:84,h:109},"34":{w:86,h:111} },
-    "Zara":           { "XS":{w:62,h:88},"S":{w:66,h:92},"M":{w:70,h:96},"L":{w:74,h:100},"XL":{w:78,h:104} },
-    "H&M":            { "34":{w:62,h:88},"36":{w:66,h:92},"38":{w:70,h:96},"40":{w:74,h:100},"42":{w:78,h:104},"44":{w:82,h:108} },
-    "ASOS":           { "6":{w:61,h:87},"8":{w:65,h:91},"10":{w:69,h:95},"12":{w:73,h:99},"14":{w:77,h:103},"16":{w:81,h:107} },
-    "Fashion Nova":   { "XS":{w:62,h:88},"S":{w:66,h:92},"M":{w:70,h:97},"L":{w:75,h:102},"XL":{w:80,h:107},"XXL":{w:85,h:112} },
-    "PrettyLittleThing": { "6":{w:61,h:87},"8":{w:65,h:91},"10":{w:69,h:95},"12":{w:73,h:100},"14":{w:78,h:105},"16":{w:83,h:110} },
-    "Boohoo":         { "6":{w:61,h:87},"8":{w:65,h:91},"10":{w:69,h:95},"12":{w:73,h:100},"14":{w:78,h:105},"16":{w:83,h:110} },
-    "Shein":          { "XS":{w:62,h:86},"S":{w:66,h:90},"M":{w:70,h:94},"L":{w:74,h:99},"XL":{w:79,h:104},"XXL":{w:84,h:109} },
-    "Good American":  { "6":{w:61,h:88},"8":{w:65,h:92},"10":{w:69,h:96},"12":{w:73,h:100},"14":{w:77,h:104},"16":{w:81,h:108} },
-    "River Island":   { "6":{w:61,h:86},"8":{w:65,h:90},"10":{w:69,h:94},"12":{w:73,h:98},"14":{w:77,h:102},"16":{w:81,h:106} },
-    "Mr Price":       { "XS":{w:63,h:88},"S":{w:67,h:92},"M":{w:71,h:96},"L":{w:75,h:100},"XL":{w:80,h:105} },
-    "Woolworths SA":  { "10":{w:67,h:92},"12":{w:71,h:96},"14":{w:75,h:100},"16":{w:79,h:104},"18":{w:83,h:108} },
+    "Levi's": {
+      sizeSystem: 'denim-inch', measurementType: 'unknown',
+      source: 'https://www.levi.com/GB/en_GB/info/sizechart', verified: null,
+      sizes: { "24":{w:61,h:86},"25":{w:64,h:89},"26":{w:66,h:91},"27":{w:69,h:94},"28":{w:71,h:96},"29":{w:74,h:99},"30":{w:76,h:101},"31":{w:79,h:104},"32":{w:81,h:106},"33":{w:84,h:109},"34":{w:86,h:111} },
+    },
+    "Zara": {
+      sizeSystem: 'alpha', measurementType: 'unknown', source: null, verified: null,
+      sizes: { "XS":{w:62,h:88},"S":{w:66,h:92},"M":{w:70,h:96},"L":{w:74,h:100},"XL":{w:78,h:104} },
+    },
+    "H&M": {
+      // H&M publishes size charts per garment, not per brand — a single row
+      // here cannot represent it correctly. See brands-sources.md.
+      sizeSystem: 'EU', measurementType: 'unknown', source: null, verified: null,
+      sizes: { "34":{w:62,h:88},"36":{w:66,h:92},"38":{w:70,h:96},"40":{w:74,h:100},"42":{w:78,h:104},"44":{w:82,h:108} },
+    },
+    "ASOS": {
+      sizeSystem: 'UK', measurementType: 'unknown',
+      source: 'https://www.asos.com/discover/size-charts/women/dresses/', verified: null,
+      sizes: { "6":{w:61,h:87},"8":{w:65,h:91},"10":{w:69,h:95},"12":{w:73,h:99},"14":{w:77,h:103},"16":{w:81,h:107} },
+    },
+    "Fashion Nova": {
+      sizeSystem: 'alpha', measurementType: 'unknown', source: null, verified: null,
+      sizes: { "XS":{w:62,h:88},"S":{w:66,h:92},"M":{w:70,h:97},"L":{w:75,h:102},"XL":{w:80,h:107},"XXL":{w:85,h:112} },
+    },
+    "PrettyLittleThing": {
+      sizeSystem: 'UK', measurementType: 'unknown', source: null, verified: null,
+      sizes: { "6":{w:61,h:87},"8":{w:65,h:91},"10":{w:69,h:95},"12":{w:73,h:100},"14":{w:78,h:105},"16":{w:83,h:110} },
+    },
+    "Boohoo": {
+      sizeSystem: 'UK', measurementType: 'unknown', source: null, verified: null,
+      sizes: { "6":{w:61,h:87},"8":{w:65,h:91},"10":{w:69,h:95},"12":{w:73,h:100},"14":{w:78,h:105},"16":{w:83,h:110} },
+    },
+    "Shein": {
+      sizeSystem: 'alpha', measurementType: 'unknown', source: null, verified: null,
+      sizes: { "XS":{w:62,h:86},"S":{w:66,h:90},"M":{w:70,h:94},"L":{w:74,h:99},"XL":{w:79,h:104},"XXL":{w:84,h:109} },
+    },
+    "Good American": {
+      // ⚠️ US-sized brand. These numbers are on a UK scale, so every size here
+      // is ~4 steps adrift (US 6 = UK 10). The real chart also jumps sharply at
+      // the 15/16 curve-grade break.
+      sizeSystem: 'US', measurementType: 'unknown',
+      source: 'https://www.scheels.com/size-chart/good-american-womens-apparel-size-chart', verified: null,
+      sizes: { "6":{w:61,h:88},"8":{w:65,h:92},"10":{w:69,h:96},"12":{w:73,h:100},"14":{w:77,h:104},"16":{w:81,h:108} },
+    },
+    "River Island": {
+      sizeSystem: 'UK', measurementType: 'unknown', source: null, verified: null,
+      sizes: { "6":{w:61,h:86},"8":{w:65,h:90},"10":{w:69,h:94},"12":{w:73,h:98},"14":{w:77,h:102},"16":{w:81,h:106} },
+    },
+    "Mr Price": {
+      sizeSystem: 'alpha', measurementType: 'unknown', source: null, verified: null,
+      sizes: { "XS":{w:63,h:88},"S":{w:67,h:92},"M":{w:71,h:96},"L":{w:75,h:100},"XL":{w:80,h:105} },
+    },
+    "Woolworths SA": {
+      sizeSystem: 'SA', measurementType: 'unknown', source: null, verified: null,
+      sizes: { "10":{w:67,h:92},"12":{w:71,h:96},"14":{w:75,h:100},"16":{w:79,h:104},"18":{w:83,h:108} },
+    },
   },
   dress: {
-    "Zara":           { "XS":{b:84,w:64,h:88},"S":{b:88,w:68,h:92},"M":{b:92,w:72,h:96},"L":{b:96,w:76,h:100},"XL":{b:100,w:80,h:104} },
-    "H&M":            { "34":{b:83,w:63,h:87},"36":{b:87,w:67,h:91},"38":{b:91,w:71,h:95},"40":{b:95,w:75,h:99},"42":{b:99,w:79,h:103},"44":{b:103,w:83,h:107} },
-    "ASOS":           { "6":{b:81,w:61,h:85},"8":{b:85,w:65,h:89},"10":{b:89,w:69,h:93},"12":{b:93,w:73,h:97},"14":{b:97,w:77,h:101},"16":{b:101,w:81,h:105},"18":{b:106,w:86,h:110} },
-    "Boohoo":         { "6":{b:81,w:61,h:85},"8":{b:85,w:65,h:89},"10":{b:89,w:69,h:93},"12":{b:93,w:73,h:98},"14":{b:98,w:78,h:103},"16":{b:103,w:83,h:108} },
-    "PrettyLittleThing": { "6":{b:80,w:60,h:84},"8":{b:84,w:64,h:88},"10":{b:88,w:68,h:92},"12":{b:92,w:72,h:97},"14":{b:97,w:77,h:102},"16":{b:102,w:82,h:107} },
-    "Fashion Nova":   { "XS":{b:84,w:64,h:88},"S":{b:88,w:68,h:93},"M":{b:92,w:72,h:98},"L":{b:97,w:77,h:103},"XL":{b:102,w:82,h:108},"XXL":{b:107,w:87,h:113} },
-    "Shein":          { "XS":{b:83,w:63,h:87},"S":{b:87,w:67,h:91},"M":{b:91,w:71,h:95},"L":{b:95,w:75,h:100},"XL":{b:100,w:80,h:105},"XXL":{b:105,w:85,h:110} },
-    "Mango":          { "XS":{b:84,w:64,h:88},"S":{b:88,w:68,h:92},"M":{b:92,w:72,h:96},"L":{b:96,w:76,h:100},"XL":{b:100,w:80,h:104} },
-    "Reformation":    { "0":{b:81,w:61,h:85},"2":{b:84,w:64,h:88},"4":{b:87,w:67,h:91},"6":{b:90,w:70,h:94},"8":{b:93,w:73,h:97},"10":{b:96,w:76,h:100},"12":{b:100,w:80,h:104} },
-    "Mr Price":       { "XS":{b:84,w:64,h:88},"S":{b:88,w:68,h:92},"M":{b:92,w:72,h:96},"L":{b:96,w:76,h:101},"XL":{b:101,w:81,h:106} },
+    "Zara": {
+      sizeSystem: 'alpha', measurementType: 'unknown', source: null, verified: null,
+      sizes: { "XS":{b:84,w:64,h:88},"S":{b:88,w:68,h:92},"M":{b:92,w:72,h:96},"L":{b:96,w:76,h:100},"XL":{b:100,w:80,h:104} },
+    },
+    "H&M": {
+      // Per-garment charts — see the jeans entry above.
+      sizeSystem: 'EU', measurementType: 'unknown', source: null, verified: null,
+      sizes: { "34":{b:83,w:63,h:87},"36":{b:87,w:67,h:91},"38":{b:91,w:71,h:95},"40":{b:95,w:75,h:99},"42":{b:99,w:79,h:103},"44":{b:103,w:83,h:107} },
+    },
+    "ASOS": {
+      sizeSystem: 'UK', measurementType: 'unknown',
+      source: 'https://www.asos.com/discover/size-charts/women/dresses/', verified: null,
+      sizes: { "6":{b:81,w:61,h:85},"8":{b:85,w:65,h:89},"10":{b:89,w:69,h:93},"12":{b:93,w:73,h:97},"14":{b:97,w:77,h:101},"16":{b:101,w:81,h:105},"18":{b:106,w:86,h:110} },
+    },
+    "Boohoo": {
+      sizeSystem: 'UK', measurementType: 'unknown', source: null, verified: null,
+      sizes: { "6":{b:81,w:61,h:85},"8":{b:85,w:65,h:89},"10":{b:89,w:69,h:93},"12":{b:93,w:73,h:98},"14":{b:98,w:78,h:103},"16":{b:103,w:83,h:108} },
+    },
+    "PrettyLittleThing": {
+      sizeSystem: 'UK', measurementType: 'unknown', source: null, verified: null,
+      sizes: { "6":{b:80,w:60,h:84},"8":{b:84,w:64,h:88},"10":{b:88,w:68,h:92},"12":{b:92,w:72,h:97},"14":{b:97,w:77,h:102},"16":{b:102,w:82,h:107} },
+    },
+    "Fashion Nova": {
+      sizeSystem: 'alpha', measurementType: 'unknown', source: null, verified: null,
+      sizes: { "XS":{b:84,w:64,h:88},"S":{b:88,w:68,h:93},"M":{b:92,w:72,h:98},"L":{b:97,w:77,h:103},"XL":{b:102,w:82,h:108},"XXL":{b:107,w:87,h:113} },
+    },
+    "Shein": {
+      sizeSystem: 'alpha', measurementType: 'unknown', source: null, verified: null,
+      sizes: { "XS":{b:83,w:63,h:87},"S":{b:87,w:67,h:91},"M":{b:91,w:71,h:95},"L":{b:95,w:75,h:100},"XL":{b:100,w:80,h:105},"XXL":{b:105,w:85,h:110} },
+    },
+    "Mango": {
+      sizeSystem: 'alpha', measurementType: 'unknown', source: null, verified: null,
+      sizes: { "XS":{b:84,w:64,h:88},"S":{b:88,w:68,h:92},"M":{b:92,w:72,h:96},"L":{b:96,w:76,h:100},"XL":{b:100,w:80,h:104} },
+    },
+    "Reformation": {
+      // Body measurements, US numeric — confirmed 2026-09-17. The published
+      // chart's single "Hip" column is unlabelled while the measuring guide
+      // defines both a high and a low hip; low hip is inferred, not stated.
+      sizeSystem: 'US', measurementType: 'unknown',
+      source: 'https://www.thereformation.com/fitting-and-sizes.html', verified: null,
+      sizes: { "0":{b:81,w:61,h:85},"2":{b:84,w:64,h:88},"4":{b:87,w:67,h:91},"6":{b:90,w:70,h:94},"8":{b:93,w:73,h:97},"10":{b:96,w:76,h:100},"12":{b:100,w:80,h:104} },
+    },
+    "Mr Price": {
+      sizeSystem: 'alpha', measurementType: 'unknown', source: null, verified: null,
+      sizes: { "XS":{b:84,w:64,h:88},"S":{b:88,w:68,h:92},"M":{b:92,w:72,h:96},"L":{b:96,w:76,h:101},"XL":{b:101,w:81,h:106} },
+    },
   },
   bikini: {
-    "ASOS":           { top:{"6":{b:81,band:71},"8":{b:84,band:74},"10":{b:87,band:77},"12":{b:91,band:81},"14":{b:96,band:86},"16":{b:101,band:91}}, bottom:{"6":{w:61,h:86},"8":{w:65,h:90},"10":{w:69,h:94},"12":{w:73,h:98},"14":{w:77,h:102},"16":{w:81,h:106}} },
-    "Fashion Nova":   { top:{"XS":{b:84,band:72},"S":{b:88,band:76},"M":{b:93,band:81},"L":{b:98,band:86},"XL":{b:103,band:91},"XXL":{b:109,band:97}}, bottom:{"XS":{w:62,h:88},"S":{w:66,h:92},"M":{w:71,h:97},"L":{w:76,h:102},"XL":{w:81,h:107}} },
-    "Shein":          { top:{"XS":{b:82,band:70},"S":{b:86,band:74},"M":{b:90,band:78},"L":{b:94,band:82},"XL":{b:99,band:87},"XXL":{b:104,band:92}}, bottom:{"XS":{w:62,h:87},"S":{w:66,h:91},"M":{w:70,h:95},"L":{w:75,h:100},"XL":{w:80,h:105}} },
-    "H&M":            { top:{"XS":{b:82,band:70},"S":{b:86,band:74},"M":{b:90,band:78},"L":{b:95,band:83},"XL":{b:100,band:88}}, bottom:{"XS":{w:62,h:88},"S":{w:66,h:92},"M":{w:70,h:96},"L":{w:74,h:100},"XL":{w:78,h:104}} },
-    "PrettyLittleThing": { top:{"6":{b:80,band:68},"8":{b:83,band:71},"10":{b:87,band:75},"12":{b:91,band:79},"14":{b:96,band:84},"16":{b:101,band:89}}, bottom:{"6":{w:61,h:87},"8":{w:65,h:91},"10":{w:69,h:95},"12":{w:73,h:99},"14":{w:77,h:103},"16":{w:82,h:108}} },
-    "Triangl":        { top:{"XS":{b:83,band:71},"S":{b:87,band:75},"M":{b:91,band:79},"L":{b:95,band:83},"XL":{b:100,band:88}}, bottom:{"XS":{w:62,h:88},"S":{w:66,h:92},"M":{w:70,h:96},"L":{w:75,h:101},"XL":{w:80,h:106}} },
-    "Cupshe":         { top:{"S":{b:84,band:72},"M":{b:88,band:76},"L":{b:93,band:81},"XL":{b:98,band:86},"XXL":{b:104,band:92}}, bottom:{"S":{w:64,h:90},"M":{w:68,h:94},"L":{w:73,h:99},"XL":{w:78,h:104},"XXL":{w:83,h:109}} },
-    "Boohoo":         { top:{"6":{b:81,band:69},"8":{b:84,band:72},"10":{b:88,band:76},"12":{b:92,band:80},"14":{b:97,band:85},"16":{b:102,band:90}}, bottom:{"6":{w:61,h:87},"8":{w:65,h:91},"10":{w:69,h:95},"12":{w:73,h:99},"14":{w:78,h:104},"16":{w:83,h:109}} },
+    "ASOS": {
+      sizeSystem: 'UK', measurementType: 'unknown', source: null, verified: null,
+      sizes: { top:{"6":{b:81,band:71},"8":{b:84,band:74},"10":{b:87,band:77},"12":{b:91,band:81},"14":{b:96,band:86},"16":{b:101,band:91}}, bottom:{"6":{w:61,h:86},"8":{w:65,h:90},"10":{w:69,h:94},"12":{w:73,h:98},"14":{w:77,h:102},"16":{w:81,h:106}} },
+    },
+    "Fashion Nova": {
+      sizeSystem: 'alpha', measurementType: 'unknown', source: null, verified: null,
+      sizes: { top:{"XS":{b:84,band:72},"S":{b:88,band:76},"M":{b:93,band:81},"L":{b:98,band:86},"XL":{b:103,band:91},"XXL":{b:109,band:97}}, bottom:{"XS":{w:62,h:88},"S":{w:66,h:92},"M":{w:71,h:97},"L":{w:76,h:102},"XL":{w:81,h:107}} },
+    },
+    "Shein": {
+      sizeSystem: 'alpha', measurementType: 'unknown', source: null, verified: null,
+      sizes: { top:{"XS":{b:82,band:70},"S":{b:86,band:74},"M":{b:90,band:78},"L":{b:94,band:82},"XL":{b:99,band:87},"XXL":{b:104,band:92}}, bottom:{"XS":{w:62,h:87},"S":{w:66,h:91},"M":{w:70,h:95},"L":{w:75,h:100},"XL":{w:80,h:105}} },
+    },
+    "H&M": {
+      sizeSystem: 'alpha', measurementType: 'unknown', source: null, verified: null,
+      sizes: { top:{"XS":{b:82,band:70},"S":{b:86,band:74},"M":{b:90,band:78},"L":{b:95,band:83},"XL":{b:100,band:88}}, bottom:{"XS":{w:62,h:88},"S":{w:66,h:92},"M":{w:70,h:96},"L":{w:74,h:100},"XL":{w:78,h:104}} },
+    },
+    "PrettyLittleThing": {
+      sizeSystem: 'UK', measurementType: 'unknown', source: null, verified: null,
+      sizes: { top:{"6":{b:80,band:68},"8":{b:83,band:71},"10":{b:87,band:75},"12":{b:91,band:79},"14":{b:96,band:84},"16":{b:101,band:89}}, bottom:{"6":{w:61,h:87},"8":{w:65,h:91},"10":{w:69,h:95},"12":{w:73,h:99},"14":{w:77,h:103},"16":{w:82,h:108}} },
+    },
+    "Triangl": {
+      sizeSystem: 'alpha', measurementType: 'unknown', source: null, verified: null,
+      sizes: { top:{"XS":{b:83,band:71},"S":{b:87,band:75},"M":{b:91,band:79},"L":{b:95,band:83},"XL":{b:100,band:88}}, bottom:{"XS":{w:62,h:88},"S":{w:66,h:92},"M":{w:70,h:96},"L":{w:75,h:101},"XL":{w:80,h:106}} },
+    },
+    "Cupshe": {
+      sizeSystem: 'alpha', measurementType: 'unknown', source: null, verified: null,
+      sizes: { top:{"S":{b:84,band:72},"M":{b:88,band:76},"L":{b:93,band:81},"XL":{b:98,band:86},"XXL":{b:104,band:92}}, bottom:{"S":{w:64,h:90},"M":{w:68,h:94},"L":{w:73,h:99},"XL":{w:78,h:104},"XXL":{w:83,h:109}} },
+    },
+    "Boohoo": {
+      sizeSystem: 'UK', measurementType: 'unknown', source: null, verified: null,
+      sizes: { top:{"6":{b:81,band:69},"8":{b:84,band:72},"10":{b:88,band:76},"12":{b:92,band:80},"14":{b:97,band:85},"16":{b:102,band:90}}, bottom:{"6":{w:61,h:87},"8":{w:65,h:91},"10":{w:69,h:95},"12":{w:73,h:99},"14":{w:78,h:104},"16":{w:83,h:109}} },
+    },
   },
 };
 
+// Always reach a brand's size map through this — iterating a brand object
+// directly would treat `sizeSystem`/`measurementType`/etc. as size keys, which
+// is precisely what closest() and getBetween() would choke on. Read the
+// metadata fields off BRANDS[category][brand] directly.
+export const chartOf = (category, brand) => BRANDS[category]?.[brand]?.sizes ?? null;
+
 // ─── Recommendation engine ────────────────────────────────────────────────────
 
-const closest = (chart, key, val) => {
+export const closest = (chart, key, val) => {
   let best = null, bestDiff = Infinity;
   for (const [size, m] of Object.entries(chart)) {
     const d = Math.abs((m[key] ?? Infinity) - val);
@@ -100,22 +383,30 @@ const closest = (chart, key, val) => {
   return { size: best, diff: bestDiff };
 };
 
-const getBetween = (chart, key, val) => {
+// Returns the two sizes a measurement genuinely falls between, or null.
+//
+// Both comparisons are STRICT. A measurement landing exactly on a chart value
+// is not between sizes — it is that size, and closest() returns it with diff 0.
+// With inclusive bounds the result screen showed a confident size alongside a
+// "you fall between two sizes" warning contradicting it; worse, because the
+// matched size came back as the larger end, an exact S and an exact M both
+// reported {S, M}, giving two users a full size apart identical copy.
+export const getBetween = (chart, key, val) => {
   const entries = Object.entries(chart).sort((a, b) => (a[1][key] ?? 0) - (b[1][key] ?? 0));
   for (let i = 0; i < entries.length - 1; i++) {
-    if (val >= entries[i][1][key] && val <= entries[i + 1][1][key])
+    if (val > entries[i][1][key] && val < entries[i + 1][1][key])
       return { smaller: entries[i][0], larger: entries[i + 1][0] };
   }
   return null;
 };
 
-const impliedFor = (category, brand, size) => {
-  if (category === 'jeans') return BRANDS.jeans[brand]?.[size] ?? null;
-  if (category === 'dress') return BRANDS.dress[brand]?.[size] ?? null;
+export const impliedFor = (category, brand, size) => {
+  if (category === 'jeans') return chartOf('jeans', brand)?.[size] ?? null;
+  if (category === 'dress') return chartOf('dress', brand)?.[size] ?? null;
   return null;
 };
 
-const blendValues = (measured, ...implied) => {
+export const blendValues = (measured, ...implied) => {
   const all = [measured, ...implied].filter(Boolean);
   if (all.length === 1) return measured;
   const keys = Object.keys(measured);
@@ -127,23 +418,29 @@ const blendValues = (measured, ...implied) => {
   return result;
 };
 
-const prefOffset = (preference) =>
+export const prefOffset = (preference) =>
   preference === 'fitted' ? -2 : preference === 'relaxed' ? 2 : 0;
 
-const anchorConfidence = (n, variance) => {
+export const anchorConfidence = (n, variance) => {
   if (n >= 3 && variance <= 4) return { level: 'High', note: 'Your size signals agree closely across brands.' };
   if (n >= 2 && variance <= 6) return { level: 'Medium-High', note: 'Your anchors broadly agree — a confident estimate.' };
+  // Two or more anchors that disagree by more than 6cm. They WERE used — the
+  // blend simply has a wide spread — so report the spread. This branch has to
+  // sit above the n === 1 test: without it these cases fell through to the
+  // final return, which told a user who had supplied three anchors that the
+  // estimate was "based on your measurements alone".
+  if (n >= 2) return { level: 'Medium', note: `Your anchors disagree by about ${Math.round(variance)}cm, so this leans more on your own measurements. Worth checking the sizes you entered.` };
   if (n === 1) return { level: 'Medium', note: 'Based on one anchor plus your measurements.' };
   return { level: 'Medium', note: 'Based on your measurements alone. More anchors sharpen this.' };
 };
 
-function recommend({ category, measurements: m, anchors = [], preference = 'regular', targetBrand, shape, height }) {
+export function recommend({ category, measurements: m, anchors = [], preference = 'regular', targetBrand, shape, height }) {
   const validAnchors = anchors.filter(a => a.brand && a.size);
   const h = parseFloat(height) || 0;
   const off = prefOffset(preference);
 
   if (category === 'jeans') {
-    const chart = BRANDS.jeans[targetBrand];
+    const chart = chartOf('jeans', targetBrand);
     if (!chart) return null;
 
     const implied = validAnchors.map(a => impliedFor('jeans', a.brand, a.size)).filter(Boolean);
@@ -174,7 +471,7 @@ function recommend({ category, measurements: m, anchors = [], preference = 'regu
   }
 
   if (category === 'dress') {
-    const chart = BRANDS.dress[targetBrand];
+    const chart = chartOf('dress', targetBrand);
     if (!chart) return null;
 
     const implied = validAnchors.map(a => impliedFor('dress', a.brand, a.size)).filter(Boolean);
@@ -203,7 +500,7 @@ function recommend({ category, measurements: m, anchors = [], preference = 'regu
   }
 
   if (category === 'bikini') {
-    const brandData = BRANDS.bikini[targetBrand];
+    const brandData = chartOf('bikini', targetBrand);
     if (!brandData) return null;
     const bust = parseFloat(m.bust) || 0;
     const hip  = parseFloat(m.hip)  || 0;
@@ -400,7 +697,15 @@ const GLOBAL_CSS = `
   .fg-header-bar { display: flex; align-items: center; justify-content: space-between; height: 72px; }
   .fg-nav { display: flex; align-items: center; gap: 28px; }
 
+  .fg-footer      { padding: 64px 0 48px; }
   .fg-footer-grid { display: grid; grid-template-columns: 2fr 1fr 1fr 1fr; gap: 48px; margin-bottom: 48px; }
+  .fg-footer-col  { display: flex; flex-direction: column; gap: 10px; align-items: flex-start; }
+  .fg-footer-col .fg-link { padding: 0; }
+  .fg-footer-wordmark { font-family: var(--font-display); font-size: 32px; }
+  .fg-footer-tagline  { font-family: var(--font-display); font-style: italic; font-size: 18px;
+    color: ${RUST}; margin: 8px 0 0; }
+  .fg-footer-bottom { border-top: 1px solid var(--color-border-light); padding-top: 24px;
+    display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 16px; }
 
   .fg-press-grid  { display: grid; grid-template-columns: 180px 1fr auto; gap: 32px; align-items: baseline;
     padding: 28px 0; border-top: 1px solid var(--color-border-light); }
@@ -438,7 +743,31 @@ const GLOBAL_CSS = `
     .fg-two-col, .fg-anchor-row, .fg-story-grid, .fg-shape-grid { grid-template-columns: 1fr; gap: 24px; }
     .fg-numbers-strip { grid-template-columns: 1fr; gap: 28px; padding: 24px 0; }
     .fg-numbers-strip .fg-stat { font-size: 44px; }
-    .fg-footer-grid { grid-template-columns: 1fr; gap: 32px; }
+    /* Footer on a phone. Stacking all four blocks in one column ran the footer
+       past a full viewport height (819px on a 375x812 screen) while leaving
+       most of the width empty, so the link groups sit two-up and the brand
+       block spans the row above them. Links get vertical padding instead of a
+       flex gap: the same visual rhythm, but the tap target is the whole row
+       rather than a 19px strip of text. */
+    .fg-footer { padding: 40px 0 32px; }
+    .fg-footer-grid { grid-template-columns: 1fr 1fr; gap: 28px 24px; margin-bottom: 28px; }
+    .fg-footer-brand { grid-column: 1 / -1; }
+    /* Placed explicitly rather than left to auto-flow. Company has five links
+       against Product's three, so flowing them left it a dead patch under
+       Product and an empty half-row beside Follow. Company spans both rows on
+       the right; Product and Follow stack down the left. */
+    .fg-footer-product { grid-column: 1; grid-row: 2; }
+    .fg-footer-company { grid-column: 2; grid-row: 2 / span 2; }
+    .fg-footer-follow  { grid-column: 1; grid-row: 3; }
+    .fg-footer-brand svg { height: 52px; width: auto; }
+    .fg-footer-wordmark { font-size: 26px; }
+    .fg-footer-tagline { font-size: 16px; }
+    .fg-footer-col { gap: 0; }
+    /* display:block matters — the Follow items are spans, and vertical padding
+       does not grow an inline box, so without it they keep a 21px tap target
+       while the button rows get 39px. */
+    .fg-footer-col .fg-link { display: block; font-size: 14px; padding: 10px 0; }
+    .fg-footer-bottom { gap: 10px; }
     .fg-prose h3 { font-size: 22px; margin: 36px 0 12px; }
     .fg-press-grid { grid-template-columns: 1fr; gap: 8px; padding: 20px 0; }
     .fg-press-grid .fg-press-meta { order: -1; }
@@ -561,35 +890,43 @@ function Footer({ onNav }) {
   const linkBtn = (label, page) => (
     <button type="button" onClick={() => onNav(page)}
       className="fg-link"
-      style={{ background: 'none', border: 'none', padding: 0, cursor: 'pointer', font: 'inherit', textAlign: 'left' }}>
+      // Neither padding nor font is set here, and both omissions are load
+      // bearing: an inline style beats the media query, so the mobile
+      // breakpoint could not grow these into a tap target or resize them.
+      // `font: inherit` in particular reset font-size, which is why these
+      // buttons rendered at 16px beside the 13px Follow spans. .fg-link
+      // supplies the family and size; the rules below reset the button chrome.
+      style={{ background: 'none', border: 'none', cursor: 'pointer', textAlign: 'left' }}>
       {label}
     </button>
   );
+  // Sizing and spacing live in CSS rather than inline style objects so the
+  // mobile breakpoint can override them — an inline style would win over the
+  // media query and there would be no way to retune the footer for a phone.
   const colHeader = { fontFamily: 'var(--font-body)', fontSize: 11, fontWeight: 500, letterSpacing: '.1em', textTransform: 'uppercase', color: 'var(--color-text-muted)', margin: '0 0 16px' };
-  const colWrap = { display: 'flex', flexDirection: 'column', gap: 10 };
   const bottom = { fontFamily: 'var(--font-body)', fontSize: 12, fontWeight: 300, letterSpacing: '.06em', color: 'var(--color-text-muted)', margin: 0 };
   return (
-    <footer style={{ borderTop: `1px solid ${INK}`, marginTop: 'auto', padding: '64px 0 48px' }}>
+    <footer className="fg-footer" style={{ borderTop: `1px solid ${INK}`, marginTop: 'auto' }}>
       <Container wide>
         <div className="fg-footer-grid">
-          <div>
+          <div className="fg-footer-brand">
             <div style={{ display: 'flex', alignItems: 'center', gap: 14, color: INK }}>
               <FitseamLogo height={68} />
-              <span style={{ fontFamily: 'var(--font-display)', fontSize: 32 }}>Fitseam</span>
+              <span className="fg-footer-wordmark">Fitseam</span>
             </div>
-            <p style={{ fontFamily: 'var(--font-display)', fontStyle: 'italic', fontSize: 18, color: RUST, margin: '8px 0 0' }}>Built for every body.</p>
+            <p className="fg-footer-tagline">Built for every body.</p>
           </div>
-          <div>
+          <div className="fg-footer-product">
             <p style={colHeader}>Product</p>
-            <div style={colWrap}>
+            <div className="fg-footer-col">
               {linkBtn('Find my size', 'form')}
               {linkBtn('About', 'about')}
               {linkBtn('For brands', 'brands')}
             </div>
           </div>
-          <div>
+          <div className="fg-footer-company">
             <p style={colHeader}>Company</p>
-            <div style={colWrap}>
+            <div className="fg-footer-col">
               {linkBtn('Contact', 'contact')}
               {linkBtn('Terms', 'terms')}
               {linkBtn('Privacy', 'privacy')}
@@ -597,16 +934,16 @@ function Footer({ onNav }) {
               {linkBtn('Refunds', 'refunds')}
             </div>
           </div>
-          <div>
+          <div className="fg-footer-follow">
             <p style={colHeader}>Follow</p>
-            <div style={colWrap}>
+            <div className="fg-footer-col">
               <span className="fg-link">Instagram</span>
               <span className="fg-link">TikTok</span>
               <span className="fg-link">Twitter / X</span>
             </div>
           </div>
         </div>
-        <div style={{ borderTop: '1px solid var(--color-border-light)', paddingTop: 24, display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 16 }}>
+        <div className="fg-footer-bottom">
           <p style={bottom}>
             © 2026 Fitseam. Are you a brand?{' '}
             <button type="button" onClick={() => onNav('brands')} className="fg-link-accent"
@@ -656,7 +993,7 @@ function Landing({ count, onStart }) {
           Your size didn't change.<br />The clothes did.
         </h1>
         <p style={{ fontFamily: 'var(--font-body)', fontSize: 18, lineHeight: 1.6, color: 'var(--color-text-secondary)', maxWidth: 480, margin: '24px 0 36px' }}>
-          Fitseam tells you your exact size at any brand — and flags fit problems before you buy. Denim. Dresses. Bikinis.
+          Fitseam works out your size at any brand — and flags fit problems before you buy. Denim. Dresses. Bikinis.
         </p>
         <div style={{ display: 'flex', alignItems: 'center', gap: 24, flexWrap: 'wrap' }}>
           <button onClick={onStart} className="fg-btn-dark">Find my size →</button>
@@ -758,6 +1095,8 @@ function FormFlow({ onComplete, onExit }) {
   const [fit, setFit] = useState('');
   const [target, setTarget] = useState('');
   const [consent, setConsent] = useState(false);
+  const [hp, setHp] = useState('');
+  const turnstile = useTurnstile();
 
   const setMeasure = (k) => (e) => setM(p => ({ ...p, [k]: e.target.value }));
   const brandList = category ? Object.keys(BRANDS[category === 'jeans' ? 'jeans' : category === 'dress' ? 'dress' : 'bikini']) : [];
@@ -767,9 +1106,9 @@ function FormFlow({ onComplete, onExit }) {
   };
   const targetBrands = brandList.filter(b => !anchors.some(a => a.brand === b));
   const sizesFor = (brand) => {
-    const chart = category === 'jeans' ? BRANDS.jeans[brand]
-      : category === 'dress' ? BRANDS.dress[brand]
-      : BRANDS.bikini[brand]?.top;
+    const chart = category === 'jeans' ? chartOf('jeans', brand)
+      : category === 'dress' ? chartOf('dress', brand)
+      : chartOf('bikini', brand)?.top;
     return chart ? Object.keys(chart) : [];
   };
 
@@ -795,7 +1134,14 @@ function FormFlow({ onComplete, onExit }) {
 
   const finish = () => {
     const profile = { category, measurements: m, shape, anchors, preference: fit, targetBrand: target, height: m.height };
-    onComplete({ ...profile, result: recommend(profile) });
+    // Honeypot tripped: still show the user their result — the recommendation
+    // is computed client-side and costs nothing — but skip the remote write.
+    onComplete({
+      ...profile,
+      result: recommend(profile),
+      suppressWrite: !!hp,
+      turnstileToken: turnstile.token,
+    });
   };
 
   const back = () => setStep(s => Math.max(0, s - 1));
@@ -1024,6 +1370,8 @@ function FormFlow({ onComplete, onExit }) {
                 I understand my size is an estimate, not a guarantee, and I agree to Fitseam's Privacy Policy and Terms of Service.
               </label>
             </div>
+            <Honeypot id="fg-company-website" value={hp} onChange={(e) => setHp(e.target.value)} />
+            <TurnstileWidget innerRef={turnstile.ref} />
           </div>
         )}
 
@@ -1032,7 +1380,7 @@ function FormFlow({ onComplete, onExit }) {
           <button onClick={step === 0 ? onExit : back} className="fg-btn-ghost">← {step === 0 ? 'Home' : 'Back'}</button>
           {step < 6
             ? <button onClick={next} disabled={!canNext()} className="fg-btn-dark">Continue</button>
-            : <button onClick={finish} disabled={!consent} className="fg-btn-dark">Get my size</button>
+            : <button onClick={finish} disabled={!consent || !turnstile.ready} className="fg-btn-dark">Get my size</button>
           }
         </div>
       </Container>
@@ -1047,6 +1395,10 @@ const FLAG_BORDER = { warning: '#B85C3C', length: '#1A1A1A', tip: 'rgba(26,26,26
 function ResultScreen({ profile, onRestart }) {
   const r = profile.result;
   const [feedback, setFeedback] = useState(null);
+  // Feedback needs its own token: Turnstile tokens are single-use, and the one
+  // from the wizard was already spent on the profiles insert. Declared above
+  // the early return below to keep hook order stable.
+  const turnstile = useTurnstile();
 
   if (!r) return (
     <Container style={{ paddingTop: 'var(--space-9)', paddingBottom: 'var(--space-9)' }}>
@@ -1060,6 +1412,10 @@ function ResultScreen({ profile, onRestart }) {
 
   const submitFeedback = (accurate) => {
     setFeedback(accurate);
+    // The buttons unmount after one click, but a reload re-renders them, so
+    // the cooldown is what actually stops a refresh-and-resubmit loop.
+    if (cooldownLeft('feedback') > 0) return;
+    startCooldown('feedback');
     const recommended = isBikini ? { top: r.topSize, bottom: r.bottomSize } : { size: r.size };
     insertRow('feedback', {
       accurate,
@@ -1067,7 +1423,7 @@ function ResultScreen({ profile, onRestart }) {
       target_brand: profile.targetBrand,
       recommended,
       confidence: r.confidence,
-    }, `fg:feedback:${rid()}`);
+    }, `fg:feedback:${rid()}`, turnstile.token);
   };
 
   return (
@@ -1129,9 +1485,10 @@ function ResultScreen({ profile, onRestart }) {
                 <p style={{ fontFamily: 'var(--font-body)', fontSize: 13, color: 'var(--color-text-secondary)', marginBottom: 'var(--space-5)', lineHeight: 1.6 }}>
                   Your gut check — based on your body knowledge, before trying it.
                 </p>
+                <TurnstileWidget innerRef={turnstile.ref} />
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, maxWidth: 400 }}>
-                  <button onClick={() => submitFeedback(true)}  className="fg-btn-dark">Yes, accurate</button>
-                  <button onClick={() => submitFeedback(false)} className="fg-btn-outline">No, it's off</button>
+                  <button onClick={() => submitFeedback(true)}  disabled={!turnstile.ready} className="fg-btn-dark">Yes, accurate</button>
+                  <button onClick={() => submitFeedback(false)} disabled={!turnstile.ready} className="fg-btn-outline">No, it's off</button>
                 </div>
               </>
             )}
@@ -1524,11 +1881,26 @@ function RefundPage({ onNav }) {
 function ContactForm() {
   const [state, setState] = useState({ name: '', email: '', topic: '', message: '' });
   const [sent, setSent] = useState(false);
+  const [hp, setHp] = useState('');
+  const [cooling, beginCooldown] = useCooldown('contact');
+  const [status, send] = useSubmission();
+  const turnstile = useTurnstile();
   const upd = (k) => (e) => setState(s => ({ ...s, [k]: e.target.value }));
-  const ready = state.name && state.email && state.topic && state.message;
-  const submit = () => {
-    insertRow('contact_messages', { ...state, kind: 'general' }, `fg:contact:${rid()}`);
-    setSent(true);
+  const ready = state.name && state.email && state.topic && state.message && cooling <= 0
+    && turnstile.ready && status !== 'sending';
+  const submit = async () => {
+    // Honeypot tripped: drop the submission entirely — no Supabase write, no
+    // local record — but show the same confirmation, so a bot can't tell it
+    // was caught and retry with the field left blank.
+    if (hp) { setSent(true); return; }
+    beginCooldown();
+    // Only claim we have the message once the write actually landed. On
+    // failure the form stays on screen with the user's text intact and
+    // SendFailed offers the email route instead.
+    const delivered = await send(() =>
+      insertRow('contact_messages', { ...state, kind: 'general' }, `fg:contact:${rid()}`, turnstile.token));
+    if (delivered) setSent(true);
+    else turnstile.reset(); // the token is spent either way — get a fresh one
   };
   if (sent) return (
     <div style={{ borderTop: `1px solid ${INK}`, paddingTop: 32 }}>
@@ -1540,6 +1912,7 @@ function ContactForm() {
   );
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 20, maxWidth: 560 }}>
+      {status === 'failed' && <SendFailed what="message" />}
       <div className="fg-anchor-row">
         <div>
           <label className="fg-label" htmlFor="contact-name">Your name</label>
@@ -1565,10 +1938,14 @@ function ContactForm() {
         <label className="fg-label" htmlFor="contact-message">Your message</label>
         <textarea id="contact-message" className="fg-textarea" placeholder="Be specific. We'll be specific back." value={state.message} onChange={upd('message')} />
       </div>
+      <Honeypot id="contact-company-website" value={hp} onChange={(e) => setHp(e.target.value)} />
+      <TurnstileWidget innerRef={turnstile.ref} />
       <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginTop: 8, flexWrap: 'wrap' }}>
-        <button onClick={submit} disabled={!ready} className="fg-btn-dark">Send →</button>
+        <button onClick={submit} disabled={!ready} className="fg-btn-dark">
+          {status === 'sending' ? 'Sending…' : status === 'failed' ? 'Try again →' : 'Send →'}
+        </button>
         <p style={{ fontFamily: 'var(--font-body)', fontSize: 12, color: 'var(--color-text-muted)', margin: 0 }}>
-          We use your email only to reply.
+          {cooling > 0 ? cooldownNote(cooling) : 'We use your email only to reply.'}
         </p>
       </div>
     </div>
@@ -1625,11 +2002,22 @@ function ContactPage({ onNav }) {
 function BrandForm() {
   const [state, setState] = useState({ brand: '', role: '', category: '', returns: '', name: '', email: '' });
   const [sent, setSent] = useState(false);
+  const [hp, setHp] = useState('');
+  const [cooling, beginCooldown] = useCooldown('brand');
+  const [status, send] = useSubmission();
+  const turnstile = useTurnstile();
   const upd = (k) => (e) => setState(s => ({ ...s, [k]: e.target.value }));
-  const ready = state.brand && state.role && state.category && state.email;
-  const submit = () => {
-    insertRow('brand_inquiries', state, `fg:brand:${rid()}`);
-    setSent(true);
+  const ready = state.brand && state.role && state.category && state.email && cooling <= 0
+    && turnstile.ready && status !== 'sending';
+  const submit = async () => {
+    if (hp) { setSent(true); return; }   // honeypot — see ContactForm
+    beginCooldown();
+    // "You'll hear back from the founder within two working days" is only true
+    // if the inquiry reached us. See useSubmission.
+    const delivered = await send(() =>
+      insertRow('brand_inquiries', state, `fg:brand:${rid()}`, turnstile.token));
+    if (delivered) setSent(true);
+    else turnstile.reset();
   };
   if (sent) return (
     <div style={{ borderTop: `1px solid ${INK}`, paddingTop: 32 }}>
@@ -1641,6 +2029,7 @@ function BrandForm() {
   );
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 20, maxWidth: 640 }}>
+      {status === 'failed' && <SendFailed what="inquiry" />}
       <div className="fg-anchor-row">
         <div>
           <label className="fg-label" htmlFor="brand-name">Brand name</label>
@@ -1692,10 +2081,14 @@ function BrandForm() {
           <input id="brand-contact-email" className="fg-input" type="email" placeholder="you@brand.com" value={state.email} onChange={upd('email')} />
         </div>
       </div>
+      <Honeypot id="brand-company-website" value={hp} onChange={(e) => setHp(e.target.value)} />
+      <TurnstileWidget innerRef={turnstile.ref} />
       <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginTop: 8, flexWrap: 'wrap' }}>
-        <button onClick={submit} disabled={!ready} className="fg-btn-dark">Request an audit →</button>
+        <button onClick={submit} disabled={!ready} className="fg-btn-dark">
+          {status === 'sending' ? 'Sending…' : status === 'failed' ? 'Try again →' : 'Request an audit →'}
+        </button>
         <p style={{ fontFamily: 'var(--font-body)', fontSize: 12, color: 'var(--color-text-muted)', margin: 0 }}>
-          No marketing follow-up. One reply, from a human.
+          {cooling > 0 ? cooldownNote(cooling) : 'No marketing follow-up. One reply, from a human.'}
         </p>
       </div>
     </div>
@@ -1802,11 +2195,58 @@ function BrandsPage() {
 // ─── App ──────────────────────────────────────────────────────────────────────
 
 export default function FitseamV2() {
-  const [page, setPage] = useState('home');
+  // Page state is mirrored into the address bar so every page is a real,
+  // linkable, indexable URL. See routes.js for why that was worth doing.
+  const [page, setPage] = useState(() => pageForPath(window.location.pathname));
   const [profile, setProfile] = useState(null);
   const [count, setCount] = useState(() => local.readInt('fg:count', 0));
 
   useEffect(() => { window.scrollTo(0, 0); }, [page]);
+
+  // Keep the document head in step with the page. Without this every route
+  // would share the landing page's title and canonical, which is the same as
+  // having no routes at all as far as a crawler is concerned.
+  useEffect(() => {
+    document.title = titleForPage(page);
+    let link = document.querySelector('link[rel="canonical"]');
+    if (!link) {
+      link = document.createElement('link');
+      link.setAttribute('rel', 'canonical');
+      document.head.appendChild(link);
+    }
+    link.setAttribute('href', canonicalForPage(page));
+  }, [page]);
+
+  // Back/forward buttons.
+  useEffect(() => {
+    const onPop = () => {
+      const next = pageForPath(window.location.pathname);
+      // Nothing to render for /your-size on a fresh history entry.
+      setPage(isTransient(next) && !profile ? DEFAULT_PAGE : next);
+    };
+    window.addEventListener('popstate', onPop);
+    return () => window.removeEventListener('popstate', onPop);
+  }, [profile]);
+
+  // A cold load of a transient route (someone bookmarked or shared their
+  // result) has no profile in memory, so rewrite it to home rather than
+  // rendering a blank page.
+  useEffect(() => {
+    const here = window.location.pathname;
+    const resolved = pageForPath(here);
+    // A transient route on a cold load has nothing to render, so it goes home.
+    const target = isTransient(resolved) && !profile ? DEFAULT_PAGE : resolved;
+    // Normalise the address bar to the route's canonical path. This covers a
+    // trailing slash (/terms/ → /terms) and a path matching no route at all,
+    // which resolves to home — the host serves index.html for everything, so
+    // the app is its own 404 handler and the URL should say so.
+    const canonical = pathForPage(target);
+    if (canonical !== here) window.history.replaceState({ page: target }, '', canonical);
+    if (target !== resolved) setPage(target);
+    // Intentionally mount-only: this is the cold-load guard, and re-running it
+    // when `profile` arrives would bounce the user off their own result.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Prefer the live remote count on mount; fall back to whatever we cached locally.
   useEffect(() => {
@@ -1823,22 +2263,39 @@ export default function FitseamV2() {
 
   const onProfileComplete = (p) => {
     setProfile(p);
-    setCount(c => { const n = c + 1; local.writeInt('fg:count', n); return n; });
-    insertRow('profiles', {
-      category: p.category,
-      measurements: p.measurements,
-      shape: p.shape || null,
-      anchors: p.anchors,
-      preference: p.preference,
-      target_brand: p.targetBrand,
-      height: p.height || null,
-      result: p.result,
-    }, `fg:profile:${rid()}`);
-    setPage('result');
+    nav('result');
+    // Honeypot tripped, or a sizing was submitted in the last 30s: show the
+    // result but don't write. The counter is driven off this table, so an
+    // unthrottled write here inflates a public-facing number.
+    if (p.suppressWrite || cooldownLeft('profile') > 0) return;
+    startCooldown('profile');
+    // The counter is a public-facing claim about how many people we have sized,
+    // and it used to increment here — before the insert, regardless of whether
+    // it succeeded. With every write failing that meant a number climbing in
+    // the browser while the table stayed empty. Only count a row we actually
+    // wrote. The result itself is computed client-side and is shown either way.
+    (async () => {
+      const res = await insertRow('profiles', {
+        category: p.category,
+        measurements: p.measurements,
+        shape: p.shape || null,
+        anchors: p.anchors,
+        preference: p.preference,
+        target_brand: p.targetBrand,
+        height: p.height || null,
+        result: p.result,
+      }, `fg:profile:${rid()}`, p.turnstileToken);
+      if (res?.ok && !res.offline) {
+        setCount(c => { const n = c + 1; local.writeInt('fg:count', n); return n; });
+      }
+    })();
   };
 
+  // The single entry point for changing page. Everything routes through here so
+  // the URL can never drift out of sync with what is on screen.
   const nav = (target) => {
-    if (target === 'form') { setPage('form'); return; }
+    if (target === page) return;
+    window.history.pushState({ page: target }, '', pathForPage(target));
     setPage(target);
   };
 
@@ -1847,9 +2304,9 @@ export default function FitseamV2() {
       <style>{GLOBAL_CSS}</style>
       <Header count={count} onNav={nav} />
       <div style={{ flex: 1 }}>
-        {page === 'home'    && <Landing count={count} onStart={() => setPage('form')} />}
-        {page === 'form'    && <FormFlow onExit={() => setPage('home')} onComplete={onProfileComplete} />}
-        {page === 'result'  && profile && <ResultScreen profile={profile} onRestart={() => setPage('form')} />}
+        {page === 'home'    && <Landing count={count} onStart={() => nav('form')} />}
+        {page === 'form'    && <FormFlow onExit={() => nav('home')} onComplete={onProfileComplete} />}
+        {page === 'result'  && profile && <ResultScreen profile={profile} onRestart={() => nav('form')} />}
         {page === 'about'   && <AboutPage   onNav={nav} />}
         {page === 'privacy' && <PrivacyPage onNav={nav} />}
         {page === 'terms'   && <TermsPage   onNav={nav} />}

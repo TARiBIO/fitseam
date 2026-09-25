@@ -11,15 +11,31 @@
     <link rel="apple-touch-icon" href="%PUBLIC_URL%/favicon.svg" />
     <link rel="manifest" href="%PUBLIC_URL%/manifest.json" />
 
+    <!-- Social preview. Two rules these tags exist to satisfy:
+         1. og:image must be an ABSOLUTE https URL — scrapers do not resolve
+            root-relative paths, so "%PUBLIC_URL%/..." silently yields no image.
+         2. It must be a PNG or JPEG at 1200x630. SVG is rejected by Facebook,
+            X, LinkedIn and iMessage alike.
+         og-image.svg remains the editable master; og-image.png is rendered
+         from it. Regenerate the PNG whenever the SVG changes. -->
+    <link rel="canonical" href="https://www.fitseam.co/" />
+
     <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://www.fitseam.co/" />
+    <meta property="og:site_name" content="Fitseam" />
     <meta property="og:title" content="Fitseam — Find your real size" />
     <meta property="og:description" content="Fit intelligence for real bodies. Get your exact size at any brand — denim, dresses, bikinis." />
-    <meta property="og:image" content="%PUBLIC_URL%/og-image.svg" />
+    <meta property="og:image" content="https://www.fitseam.co/og-image.png" />
+    <meta property="og:image:type" content="image/png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="Fitseam — your size didn't change, the clothes did." />
 
     <meta name="twitter:card" content="summary_large_image" />
     <meta name="twitter:title" content="Fitseam — Find your real size" />
     <meta name="twitter:description" content="Fit intelligence for real bodies. Get your exact size at any brand — denim, dresses, bikinis." />
-    <meta name="twitter:image" content="%PUBLIC_URL%/og-image.svg" />
+    <meta name="twitter:image" content="https://www.fitseam.co/og-image.png" />
+    <meta name="twitter:image:alt" content="Fitseam — your size didn't change, the clothes did." />
 
     <title>Fitseam — Find your real size</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
